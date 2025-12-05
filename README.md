@@ -68,7 +68,7 @@ class MyTelephonyProvider(TelephonyProvider):
 | `VOICE_PROVIDER` | openai | Voice AI provider |
 | `TELEPHONY_PROVIDER` | twilio | Telephony provider |
 | `OPENAI_API_KEY` | - | OpenAI API key |
-| `OPENAI_MODEL` | gpt-4o-mini-realtime-preview | Model |
+| `OPENAI_MODEL` | gpt-4o-mini-realtime-preview-2024-12-17 | Model |
 | `OPENAI_VOICE` | ash | Voice (ash, coral, verse) |
 | `OPENAI_SYSTEM_PROMPT` | - | AI system prompt |
 

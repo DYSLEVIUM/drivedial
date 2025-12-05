@@ -1,6 +1,7 @@
 import logging
 from datetime import date
 
+from django.conf import settings
 from django.http import HttpResponse
 from rest_framework.request import Request
 from rest_framework.response import Response
@@ -146,8 +147,7 @@ class PricingView(APIView):
     permission_classes = []
 
     def get(self, request: Request) -> Response:
-        model = request.query_params.get(
-            "model", "gpt-4o-mini-realtime-preview-2024-12-17")
+        model = request.query_params.get("model", settings.OPENAI_MODEL)
         return Response({
             "model": model,
             "pricing": pricing_service.get_pricing(model),

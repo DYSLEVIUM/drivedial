@@ -1,7 +1,7 @@
 import json
 import logging
 import time
-from typing import Callable, Dict, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 import aiohttp
 from django.conf import settings
@@ -12,6 +12,123 @@ from api.services.analytics import analytics
 from api.services.call_logger import CallLogger
 
 logger = logging.getLogger("openai")
+
+TOOLS: List[Dict[str, Any]] = [
+    {
+        "type": "function",
+        "name": "search_cars",
+        "description": "Search inventory for cars. Budget: '20 lakh' = 2000000. 'under X' = budget_max only.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "budget_min": {"type": "integer", "description": "Min budget INR. Only for 'above X' or 'between X and Y'."},
+                "budget_max": {"type": "integer", "description": "Max budget INR. For 'under X', 'within X' queries."},
+                "brand": {"type": "string", "description": "Car brand"},
+                "fuel_type": {"type": "string", "enum": ["Petrol", "Diesel"]},
+                "transmission": {"type": "string", "enum": ["Manual", "Automatic", "CVT"]}
+            },
+            "required": []
+        }
+    },
+    {
+        "type": "function",
+        "name": "get_car_details",
+        "description": "Get details for a specific car by ID",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "car_id": {"type": "string", "description": "Car ID (e.g., 'swift-vxi', 'city-zx')"}
+            },
+            "required": ["car_id"]
+        }
+    },
+    {
+        "type": "function",
+        "name": "check_availability",
+        "description": "Check availability of cars from a brand",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "brand": {"type": "string", "description": "Brand name"}
+            },
+            "required": ["brand"]
+        }
+    },
+    {
+        "type": "function",
+        "name": "web_search",
+        "description": "Search the web for car reviews, comparisons, news, or general automotive info not in inventory",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "Search query about cars, reviews, comparisons"}
+            },
+            "required": ["query"]
+        }
+    },
+    {
+        "type": "function",
+        "name": "end_call",
+        "description": "End the phone call. Use when: user wants to hang up, says goodbye, or after 3+ consecutive off-topic messages",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "reason": {"type": "string", "description": "Reason for ending: 'user_request', 'off_topic', 'completed'"}
+            },
+            "required": ["reason"]
+        }
+    }
+]
+
+
+async def web_search(query: str) -> Dict[str, Any]:
+    """Perform web search using OpenAI's web search or fallback to a simple response."""
+    try:
+        async with aiohttp.ClientSession() as session:
+            headers = {
+                "Authorization": f"Bearer {settings.OPENAI_API_KEY}",
+                "Content-Type": "application/json",
+            }
+            async with session.post(
+                "https://api.openai.com/v1/chat/completions",
+                headers=headers,
+                json={
+                    "model": "gpt-4o-mini",
+                    "messages": [
+                        {"role": "system", "content": "You are a helpful assistant. Provide brief, factual information about cars."},
+                        {"role": "user", "content": f"Brief info about: {query}"}
+                    ],
+                    "temperature": 0.3,
+                    "max_tokens": 150,
+                },
+                timeout=aiohttp.ClientTimeout(total=5.0)
+            ) as resp:
+                data = await resp.json()
+                content = data.get("choices", [{}])[0].get(
+                    "message", {}).get("content", "")
+                return {"result": content, "source": "web_search"}
+    except Exception as e:
+        logger.error(f"Web search error: {e}")
+        return {"result": "Could not fetch information at the moment.", "source": "error"}
+
+
+def execute_tool(name: str, arguments: dict) -> Any:
+    if name == "search_cars":
+        return store.search(
+            budget_min=arguments.get("budget_min"),
+            budget_max=arguments.get("budget_max"),
+            brand=arguments.get("brand"),
+            fuel_type=arguments.get("fuel_type"),
+            transmission=arguments.get("transmission"),
+        )
+    elif name == "get_car_details":
+        return store.get_car(arguments.get("car_id", ""))
+    elif name == "check_availability":
+        cars = store.search_by_brand(arguments.get("brand", ""))
+        return [{"name": c["name"], "availability": c["availability"], "location": c["location"]} for c in cars]
+    elif name == "end_call":
+        return {"status": "ending", "reason": arguments.get("reason", "user_request")}
+    return None
 
 
 def build_system_prompt() -> str:
@@ -27,6 +144,8 @@ def build_system_prompt() -> str:
 
 
 class OpenAIVoiceProvider(VoiceProvider):
+    AUDIO_CHUNK_DURATION_MS = 20
+
     def __init__(
         self,
         api_key: Optional[str] = None,
@@ -44,36 +163,20 @@ class OpenAIVoiceProvider(VoiceProvider):
         self._ws: Optional[aiohttp.ClientWebSocketResponse] = None
 
         self.on_transcript: Optional[Callable[[str, bool], None]] = None
-        self.on_response_start: Optional[Callable[[], None]] = None
         self.on_response_done: Optional[Callable[[], None]] = None
+        self.on_end_call: Optional[Callable[[str], None]] = None
 
-        self._current_transcript = ""
         self._is_user_speaking = False
-        self._has_active_response = False
-        self._is_agent_speaking = False
         self._audio_delta_count = 0
-        self._current_response_id = None
-        self._last_agent_audio_time: float = 0  # For echo detection
-        self._last_response_done_time: float = 0  # Track when response completed
-        # Echo typically arrives within 100-500ms of agent audio
-        # Reduced from 1500ms to avoid flagging legitimate user speech as echo
-        self._echo_window_ms: float = 600
-        # Don't trigger new response within 3s of last response completing
-        self._response_cooldown_ms: float = 3000
-
-        self._turn_detection_config: Dict = {
-            "type": "server_vad",
-            "threshold": 0.5,
-            "prefix_padding_ms": 300,
-            # Increased to 1000ms to allow natural pauses in speech
-            # This prevents sentences from being split mid-way
-            "silence_duration_ms": 800,
-            "create_response": True,
-        }
+        self._last_audio_send_time: float = 0
+        self._estimated_playback_end: float = 0
 
     @property
     def is_connected(self) -> bool:
         return self._ws is not None and not self._ws.closed
+
+    def _is_audio_playing(self) -> bool:
+        return time.time() * 1000 < self._estimated_playback_end
 
     async def connect(self) -> None:
         if self.is_connected:
@@ -92,31 +195,49 @@ class OpenAIVoiceProvider(VoiceProvider):
         if self.call_id:
             CallLogger.log_event(
                 self.call_id, "Connected to OpenAI Realtime API")
+            analytics.start_call(self.call_id)
 
         await self._configure_session()
         await self._send_initial_greeting()
 
     async def _configure_session(self) -> None:
+        session_config = {
+            "modalities": ["text", "audio"],
+            "voice": self.voice,
+            "instructions": self.system_prompt,
+            "input_audio_format": "g711_ulaw",
+            "output_audio_format": "g711_ulaw",
+            "input_audio_transcription": {
+                "model": "gpt-4o-transcribe"
+            },
+            "input_audio_noise_reduction": {
+                "type": "far_field"
+            },
+            "turn_detection": {
+                "type": "semantic_vad",
+                "eagerness": "medium",
+                "create_response": True,
+                "interrupt_response": True
+            },
+            "tools": TOOLS,
+            "tool_choice": "auto",
+            "temperature": self.temperature,
+            "max_response_output_tokens": 1000,
+        }
+
         await self._ws.send_json({
             "type": "session.update",
-            "session": {
-                "turn_detection": self._turn_detection_config,
-                "input_audio_format": "g711_ulaw",
-                "output_audio_format": "g711_ulaw",
-                "voice": self.voice,
-                "instructions": self.system_prompt,
-                "modalities": ["text", "audio"],
-                "temperature": self.temperature,
-                "max_response_output_tokens": 1000,
-                "input_audio_transcription": {"model": "whisper-1"},
-            }
+            "session": session_config
         })
+
+        if self.call_id:
+            CallLogger.log_event(self.call_id, "Session configured")
 
     async def _send_initial_greeting(self) -> None:
         greeting_instruction = getattr(
             settings,
             "OPENAI_GREETING_INSTRUCTION",
-            "Greet the customer warmly in Hinglish. Introduce yourself from Acko Drive and ask if they are looking for a car. Be brief and natural."
+            "Greet the customer warmly. Introduce yourself and ask if they are looking for a car. Be brief and natural."
         )
         await self._ws.send_json({
             "type": "response.create",
@@ -125,33 +246,6 @@ class OpenAIVoiceProvider(VoiceProvider):
                 "instructions": greeting_instruction
             }
         })
-
-    async def update_turn_detection(
-        self,
-        threshold: Optional[float] = None,
-        silence_duration_ms: Optional[int] = None,
-        prefix_padding_ms: Optional[int] = None,
-    ) -> None:
-        if not self.is_connected:
-            return
-
-        if threshold is not None:
-            self._turn_detection_config["threshold"] = threshold
-        if silence_duration_ms is not None:
-            self._turn_detection_config["silence_duration_ms"] = silence_duration_ms
-        if prefix_padding_ms is not None:
-            self._turn_detection_config["prefix_padding_ms"] = prefix_padding_ms
-
-        await self._ws.send_json({
-            "type": "session.update",
-            "session": {
-                "turn_detection": self._turn_detection_config,
-            }
-        })
-
-        if self.call_id:
-            CallLogger.log_event(self.call_id, "Turn detection updated", str(
-                self._turn_detection_config))
 
     async def disconnect(self) -> None:
         if self._ws and not self._ws.closed:
@@ -162,7 +256,11 @@ class OpenAIVoiceProvider(VoiceProvider):
         self._session = None
 
         if self.call_id:
-            CallLogger.log_event(self.call_id, "Disconnected from OpenAI")
+            CallLogger.log_event(self.call_id, "Disconnected")
+            analytics.end_call(self.call_id)
+            cost_summary = analytics.calculate_cost(self.call_id)
+            CallLogger.log_event(
+                self.call_id, "Cost summary", str(cost_summary))
 
     async def send_audio(self, payload: str) -> None:
         if not self.is_connected:
@@ -173,113 +271,22 @@ class OpenAIVoiceProvider(VoiceProvider):
         })
 
     async def cancel_response(self) -> None:
-        if self.call_id:
-            CallLogger.log_event(
-                self.call_id,
-                "DEBUG: cancel_response called",
-                f"connected={self.is_connected}, active={self._has_active_response}, speaking={self._is_agent_speaking}"
-            )
-        if self.is_connected and self._has_active_response and self._is_agent_speaking:
-            await self._ws.send_json({"type": "response.cancel"})
-            self._has_active_response = False
-            self._is_agent_speaking = False
-            if self.call_id:
-                CallLogger.log_event(self.call_id, "Response CANCELLED")
-
-    async def inject_context(self, context: str, trigger_response: bool = True) -> None:
-        if not self.is_connected or not context:
-            return
-
-        # Check if we're in cooldown (response just completed)
-        time_since_last_response = (
-            time.time() * 1000) - self._last_response_done_time
-        in_cooldown = time_since_last_response < self._response_cooldown_ms
-
-        if self.call_id:
-            CallLogger.log_event(
-                self.call_id,
-                "DEBUG: inject_context",
-                f"active_response={self._has_active_response}, agent_speaking={self._is_agent_speaking}, trigger={trigger_response}, cooldown={in_cooldown}"
-            )
-        await self._ws.send_json({
-            "type": "conversation.item.create",
-            "item": {
-                "type": "message",
-                "role": "system",
-                "content": [{
-                    "type": "input_text",
-                    "text": f"[DATA FROM SYSTEM]: {context}"
-                }]
-            }
-        })
-        if self.call_id:
-            CallLogger.log_context_injection(self.call_id, context)
-
-        # Trigger a response so the agent speaks the injected data
-        # But skip if: active response, or a response just completed (cooldown)
-        if trigger_response and not self._has_active_response and not in_cooldown:
-            if self.call_id:
-                CallLogger.log_event(
-                    self.call_id, "DEBUG: Triggering response after context injection")
-            await self._ws.send_json({
-                "type": "response.create",
-                "response": {
-                    "modalities": ["text", "audio"],
-                    "instructions": "Respond using the data that was just provided. Be concise and natural."
-                }
-            })
-        elif in_cooldown and self.call_id:
-            CallLogger.log_event(
-                self.call_id,
-                "DEBUG: Skipping response trigger (cooldown)",
-                f"time_since_response={time_since_last_response:.0f}ms"
-            )
-
-    async def send_filler_response(self, text: str) -> None:
-        if not self.is_connected:
-            return
-        await self._ws.send_json({
-            "type": "conversation.item.create",
-            "item": {
-                "type": "message",
-                "role": "assistant",
-                "content": [{
-                    "type": "input_text",
-                    "text": text
-                }]
-            }
-        })
-        await self._ws.send_json({"type": "response.create"})
-        if self.call_id:
-            CallLogger.log_filler(self.call_id, text)
-
-    async def trigger_response_with_context(self, context: str) -> None:
-        if not self.is_connected:
-            return
-        await self._ws.send_json({
-            "type": "response.create",
-            "response": {
-                "modalities": ["text", "audio"],
-                "instructions": f"Use this data to respond: {context}"
-            }
-        })
+        pass
 
     async def listen(self) -> None:
         if self.call_id:
-            CallLogger.log_event(self.call_id, "Voice listener started")
+            CallLogger.log_event(self.call_id, "Listening started")
         try:
             async for msg in self._ws:
                 if msg.type == aiohttp.WSMsgType.TEXT:
                     await self._handle_message(json.loads(msg.data))
                 elif msg.type == aiohttp.WSMsgType.ERROR:
                     if self.call_id:
-                        CallLogger.log_error(
-                            self.call_id, "OpenAI WebSocket error")
+                        CallLogger.log_error(self.call_id, "WebSocket error")
                     break
         except Exception as e:
             if self.call_id:
-                CallLogger.log_error(
-                    self.call_id, f"OpenAI listener error: {e}")
+                CallLogger.log_error(self.call_id, f"Listener error: {e}")
             if self.on_error:
                 await self.on_error(e)
         finally:
@@ -287,185 +294,122 @@ class OpenAIVoiceProvider(VoiceProvider):
 
     async def _handle_message(self, data: dict) -> None:
         msg_type = data.get("type", "")
+        handlers = {
+            "response.audio.delta": self._handle_audio_delta,
+            "input_audio_buffer.speech_started": self._handle_speech_started,
+            "input_audio_buffer.speech_stopped": self._handle_speech_stopped,
+            "conversation.item.input_audio_transcription.completed": self._handle_user_transcription,
+            "response.audio_transcript.done": self._handle_assistant_transcription,
+            "response.done": self._handle_response_done,
+            "response.audio.done": self._handle_audio_done,
+            "response.function_call_arguments.done": self._handle_function_call,
+            "error": self._handle_error,
+        }
 
-        if msg_type == "response.audio.delta" and self.on_audio:
-            self._is_agent_speaking = True
-            self._audio_delta_count += 1
-            self._last_agent_audio_time = time.time() * 1000  # Track for echo detection
+        handler = handlers.get(msg_type)
+        if handler:
+            await handler(data)
+
+    async def _handle_audio_delta(self, data: dict) -> None:
+        self._audio_delta_count += 1
+        now = time.time() * 1000
+        self._last_audio_send_time = now
+        self._estimated_playback_end = now + \
+            (self._audio_delta_count * self.AUDIO_CHUNK_DURATION_MS) + 500
+
+        if self.on_audio:
             await self.on_audio(data.get("delta", ""))
 
-        elif msg_type == "input_audio_buffer.speech_started":
-            was_agent_speaking = self._is_agent_speaking
-            time_since_agent_audio = (
-                time.time() * 1000) - self._last_agent_audio_time
-            is_potential_echo = time_since_agent_audio < self._echo_window_ms
+    async def _handle_speech_started(self, data: dict) -> None:
+        is_playing = self._is_audio_playing()
+        self._is_user_speaking = True
 
-            self._is_user_speaking = True
-            self._current_transcript = ""
-            if self.call_id:
-                CallLogger.log_event(
-                    self.call_id,
-                    "DEBUG: Speech started",
-                    f"agent_speaking={was_agent_speaking}, active_response={self._has_active_response}, echo={is_potential_echo}"
-                )
+        if self.call_id:
+            CallLogger.log_event(
+                self.call_id, f"Speech started, audio_playing={is_playing}")
 
-            # Allow barge-in (interrupt) only if:
-            # 1. Agent is currently speaking
-            # 2. This is NOT likely echo (enough time has passed since agent audio)
-            if was_agent_speaking and not is_potential_echo and self.on_interrupt:
-                if self.call_id:
-                    CallLogger.log_event(
-                        self.call_id, "DEBUG: Barge-in detected, interrupting")
-                await self.on_interrupt()
+        if self.on_interrupt:
+            await self.on_interrupt()
 
-        elif msg_type == "input_audio_buffer.speech_stopped":
-            self._is_user_speaking = False
-            if self.call_id:
-                CallLogger.log_event(self.call_id, "DEBUG: Speech stopped")
+    async def _handle_speech_stopped(self, data: dict) -> None:
+        self._is_user_speaking = False
 
-        elif msg_type == "conversation.item.input_audio_transcription.completed":
-            transcript = data.get("transcript", "")
-            if transcript:
-                # Echo detection: if transcript comes shortly after agent audio, it might be echo
-                time_since_agent_audio = (
-                    time.time() * 1000) - self._last_agent_audio_time
-                is_potential_echo = time_since_agent_audio < self._echo_window_ms
+    async def _handle_user_transcription(self, data: dict) -> None:
+        transcript = data.get("transcript", "")
+        if transcript and self.call_id:
+            CallLogger.log_user_speech(self.call_id, transcript)
+            if self.on_transcript:
+                await self.on_transcript(transcript, True)
 
-                if self.call_id:
-                    if is_potential_echo:
-                        CallLogger.log_event(
-                            self.call_id,
-                            "DEBUG: Potential echo detected",
-                            f"transcript='{transcript[:30]}...', time_since_agent={time_since_agent_audio:.0f}ms"
-                        )
-                    CallLogger.log_user_speech(self.call_id, transcript)
+    async def _handle_assistant_transcription(self, data: dict) -> None:
+        transcript = data.get("transcript", "")
+        if transcript and self.call_id:
+            CallLogger.log_assistant_speech(self.call_id, transcript)
+            if self.on_transcript:
+                await self.on_transcript(transcript, False)
 
-                # Still pass to transcript handler - let it decide based on intent
-                if self.on_transcript:
-                    await self.on_transcript(transcript, True)
+    async def _handle_response_done(self, data: dict) -> None:
+        self._audio_delta_count = 0
 
-        elif msg_type == "response.audio_transcript.done":
-            transcript = data.get("transcript", "")
-            if transcript:
-                if self.call_id:
-                    CallLogger.log_assistant_speech(self.call_id, transcript)
-                if self.on_transcript:
-                    await self.on_transcript(transcript, False)
+        if self.on_response_done:
+            await self.on_response_done()
 
-        elif msg_type == "response.created":
-            self._has_active_response = True
-            self._audio_delta_count = 0
-            response_id = data.get("response", {}).get("id", "unknown")
-            self._current_response_id = response_id
-            if self.call_id:
-                CallLogger.log_event(
-                    self.call_id,
-                    "DEBUG: Response CREATED",
-                    f"id={response_id}"
-                )
-            if self.on_response_start:
-                await self.on_response_start()
+        self._record_usage(data)
 
-        elif msg_type == "response.done":
-            response = data.get("response", {})
-            status = response.get("status", "unknown")
-            status_details = response.get("status_details", {})
-            response_id = response.get("id", "unknown")
+    async def _handle_audio_done(self, data: dict) -> None:
+        pass
 
-            if self.call_id:
-                CallLogger.log_event(
-                    self.call_id,
-                    "DEBUG: Response DONE",
-                    f"id={response_id}, status={status}, details={status_details}, audio_deltas={self._audio_delta_count}"
-                )
+    async def _handle_function_call(self, data: dict) -> None:
+        call_id = data.get("call_id", "")
+        name = data.get("name", "")
+        arguments_str = data.get("arguments", "{}")
 
-            self._has_active_response = False
-            self._is_agent_speaking = False
-            self._audio_delta_count = 0
-            # Track when response completed (only for completed responses, not cancelled)
-            if status == "completed":
-                self._last_response_done_time = time.time() * 1000
-            if self.on_response_done:
-                await self.on_response_done()
-            self._record_usage(data)
+        try:
+            arguments = json.loads(arguments_str)
+        except json.JSONDecodeError:
+            arguments = {}
 
-        elif msg_type == "response.output_item.added":
-            if self.call_id:
-                item = data.get("item", {})
-                CallLogger.log_event(
-                    self.call_id,
-                    "DEBUG: Output item added",
-                    f"type={item.get('type')}, id={item.get('id')}"
-                )
+        if self.call_id:
+            CallLogger.log_event(
+                self.call_id, f"Tool: {name}", json.dumps(arguments))
 
-        elif msg_type == "response.output_item.done":
-            if self.call_id:
-                item = data.get("item", {})
-                CallLogger.log_event(
-                    self.call_id,
-                    "DEBUG: Output item done",
-                    f"type={item.get('type')}, status={item.get('status')}"
-                )
-
-        elif msg_type == "response.content_part.done":
-            if self.call_id:
-                part = data.get("part", {})
-                CallLogger.log_event(
-                    self.call_id,
-                    "DEBUG: Content part done",
-                    f"type={part.get('type')}"
-                )
-
-        elif msg_type == "response.audio.done":
-            if self.call_id:
-                CallLogger.log_event(
-                    self.call_id,
-                    "DEBUG: Audio stream DONE",
-                    f"deltas_sent={self._audio_delta_count}"
-                )
-            self._is_agent_speaking = False
-
-        elif msg_type == "rate_limits.updated":
-            # Ignore rate limit updates
-            pass
-
-        elif msg_type == "session.created" or msg_type == "session.updated":
-            if self.call_id:
-                CallLogger.log_event(self.call_id, f"DEBUG: {msg_type}")
-
-        elif msg_type == "conversation.item.created":
-            if self.call_id:
-                item = data.get("item", {})
-                CallLogger.log_event(
-                    self.call_id,
-                    "DEBUG: Conversation item created",
-                    f"type={item.get('type')}, role={item.get('role')}"
-                )
-
-        elif msg_type == "error":
-            error_msg = data.get("error", {}).get("message", "Unknown error")
-            error_code = data.get("error", {}).get("code", "unknown")
-            if self.call_id:
-                CallLogger.log_error(
-                    self.call_id, f"OpenAI error: {error_code} - {error_msg}")
-            if self.on_error:
-                await self.on_error(Exception(error_msg))
-
+        if name == "web_search":
+            result = await web_search(arguments.get("query", ""))
+        elif name == "end_call":
+            result = execute_tool(name, arguments)
+            if self.on_end_call:
+                await self.on_end_call(arguments.get("reason", "user_request"))
         else:
-            # Log any unhandled message types (excluding frequent delta events)
-            ignored_types = [
-                "input_audio_buffer.committed",
-                "input_audio_buffer.cleared",
-                "response.audio_transcript.delta",
-                "conversation.item.input_audio_transcription.delta",
-                "response.content_part.added",
-            ]
-            if self.call_id and msg_type not in ignored_types:
-                CallLogger.log_event(
-                    self.call_id,
-                    "DEBUG: Unhandled msg",
-                    f"type={msg_type}"
-                )
+            result = execute_tool(name, arguments)
+
+        result_str = json.dumps(
+            result, ensure_ascii=False) if result is not None else "No results found"
+
+        if self.call_id:
+            count = len(result) if isinstance(
+                result, list) else (1 if result else 0)
+            CallLogger.log_event(self.call_id, f"Tool result: {count} items")
+
+        await self._ws.send_json({
+            "type": "conversation.item.create",
+            "item": {
+                "type": "function_call_output",
+                "call_id": call_id,
+                "output": result_str
+            }
+        })
+
+        await self._ws.send_json({"type": "response.create"})
+
+    async def _handle_error(self, data: dict) -> None:
+        error = data.get("error", {})
+        error_msg = error.get("message", "Unknown error")
+        error_code = error.get("code", "unknown")
+        if self.call_id:
+            CallLogger.log_error(
+                self.call_id, f"OpenAI: {error_code} - {error_msg}")
+        if self.on_error:
+            await self.on_error(Exception(error_msg))
 
     def _record_usage(self, data: dict) -> None:
         if not self.call_id:

@@ -41,10 +41,7 @@ class FillerGenerator:
                 return self._cache.pop(0)
 
         try:
-            filler = await asyncio.wait_for(
-                self._generate(context),
-                timeout=1.5
-            )
+            filler = await asyncio.wait_for(self._generate(context), timeout=1.5)
             if filler:
                 return filler
         except asyncio.TimeoutError:
@@ -61,24 +58,19 @@ class FillerGenerator:
             "Content-Type": "application/json",
         }
 
-        prompt = f"""Short filler for car sales agent checking system. Context: {context}
-Under 6 words. Hinglish. Example: "Hmm... ek second..."
-Just the text:"""
-
         async with session.post(
             "https://api.openai.com/v1/chat/completions",
             headers=headers,
             json={
                 "model": self.model,
-                "messages": [{"role": "user", "content": prompt}],
+                "messages": [{"role": "user", "content": f"Short filler for car sales agent. Context: {context}. Under 6 words. Just the text:"}],
                 "temperature": 0.7,
                 "max_tokens": 20,
             },
             timeout=aiohttp.ClientTimeout(total=1.5)
         ) as resp:
             data = await resp.json()
-            filler = data.get("choices", [{}])[0].get(
-                "message", {}).get("content", "").strip()
+            filler = data.get("choices", [{}])[0].get("message", {}).get("content", "").strip()
             return filler.strip('"\'') if filler else ""
 
     async def prefetch_cache(self, count: int = 3) -> None:
@@ -91,17 +83,13 @@ Just the text:"""
             "Content-Type": "application/json",
         }
 
-        prompt = f"""Generate {count} short fillers for car sales agent checking system.
-Hinglish. Under 6 words each.
-Return JSON: {{"fillers": ["...", "..."]}}"""
-
         try:
             async with session.post(
                 "https://api.openai.com/v1/chat/completions",
                 headers=headers,
                 json={
                     "model": self.model,
-                    "messages": [{"role": "user", "content": prompt}],
+                    "messages": [{"role": "user", "content": f"Generate {count} short fillers for car sales agent. Under 6 words each. Return JSON: {{\"fillers\": [\"...\"]}}"}],
                     "temperature": 0.8,
                     "max_tokens": 100,
                     "response_format": {"type": "json_object"},
@@ -109,8 +97,7 @@ Return JSON: {{"fillers": ["...", "..."]}}"""
                 timeout=aiohttp.ClientTimeout(total=3.0)
             ) as resp:
                 data = await resp.json()
-                content = data.get("choices", [{}])[0].get(
-                    "message", {}).get("content", "")
+                content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
                 parsed = json.loads(content)
                 fillers = parsed.get("fillers", [])
                 if fillers:

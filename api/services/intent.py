@@ -66,7 +66,7 @@ Respond with ONLY one word: FETCH, CHAT, or OFFTOPIC"""
                     "model": self.model,
                     "messages": [{"role": "user", "content": prompt}],
                     "temperature": 0,
-                    "max_tokens": 5,
+                    "max_tokens": 100,
                 }
             ) as resp:
                 data = await resp.json()

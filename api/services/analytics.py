@@ -94,9 +94,12 @@ class Analytics:
     def calculate_cost(
         self,
         call_id: str,
-        response_model: str = "gpt-4o-mini-realtime-preview-2024-12-17",
+        response_model: str = None,
         data_model: str = "gpt-4o-mini",
     ) -> Dict:
+        from django.conf import settings
+        if response_model is None:
+            response_model = settings.OPENAI_MODEL
         if call_id not in self._calls:
             return {"error": "Call not found"}
 
