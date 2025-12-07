@@ -4,12 +4,15 @@ import time
 from typing import Any, Callable, Dict, List, Optional
 
 import aiohttp
-from django.conf import settings
 
 from api.data.store import store
+from api.data.inventory import generate_car_url
 from api.providers.base import VoiceProvider
+from api.services.sse_manager import sse_manager
+from api.providers.prompts import prompt_3, prompt_1
 from api.services.analytics import analytics
 from api.services.call_logger import CallLogger
+from config import settings
 
 logger = logging.getLogger("openai")
 
@@ -33,11 +36,11 @@ TOOLS: List[Dict[str, Any]] = [
     {
         "type": "function",
         "name": "get_car_details",
-        "description": "Get details for a specific car by ID",
+        "description": "Get details for a specific car by slug",
         "parameters": {
             "type": "object",
             "properties": {
-                "car_id": {"type": "string", "description": "Car ID (e.g., 'swift-vxi', 'city-zx')"}
+                "car_id": {"type": "string", "description": "Car slug (e.g., 'maruti-suzuki-swift-lxi', 'maruti-suzuki-swift-zxi-plus-amt')"}
             },
             "required": ["car_id"]
         }
@@ -76,6 +79,19 @@ TOOLS: List[Dict[str, Any]] = [
                 "reason": {"type": "string", "description": "Reason for ending: 'user_request', 'off_topic', 'completed'"}
             },
             "required": ["reason"]
+        }
+    },
+    {
+        "type": "function",
+        "name": "generate_car_url",
+        "description": "Generate Acko Drive URL for a car. Use when user wants to see the car online, wants a link, or wants to view car details on website.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "car_slug": {"type": "string", "description": "Car slug identifier (e.g., 'toyota-rumion-s-cng', 'maruti-suzuki-swift-zxi-plus-amt')"},
+                "color": {"type": "string", "description": "Optional color slug (e.g., 'spunky-blue'). If not provided, uses first available color."}
+            },
+            "required": ["car_slug"]
         }
     }
 ]
@@ -125,14 +141,23 @@ def execute_tool(name: str, arguments: dict) -> Any:
         return store.get_car(arguments.get("car_id", ""))
     elif name == "check_availability":
         cars = store.search_by_brand(arguments.get("brand", ""))
-        return [{"name": c["name"], "availability": c["availability"], "location": c["location"]} for c in cars]
+        return [{"name": c["name"], "waiting_period": c["waiting_period"], "is_express_delivery": c["is_express_delivery"]} for c in cars]
     elif name == "end_call":
         return {"status": "ending", "reason": arguments.get("reason", "user_request")}
+    elif name == "generate_car_url":
+        car_slug = arguments.get("car_slug", "")
+        color = arguments.get("color")
+        url = generate_car_url(car_slug, color)
+        if url:
+            return {"url": url, "car_slug": car_slug, "color": color}
+        else:
+            return {"error": "Could not generate URL. Car or color not found."}
     return None
 
 
 def build_system_prompt() -> str:
-    base_prompt = getattr(settings, "OPENAI_SYSTEM_PROMPT", "")
+    # base_prompt = getattr(settings, "OPENAI_SYSTEM_PROMPT", "")
+    base_prompt = prompt_1.system_prompt
     context_summary = store.get_context_summary()
     return base_prompt.replace(
         "CONTEXT: You are selling cars.",
@@ -215,7 +240,7 @@ class OpenAIVoiceProvider(VoiceProvider):
             },
             "turn_detection": {
                 "type": "semantic_vad",
-                "eagerness": "medium",
+                "eagerness": "high",
                 "create_response": True,
                 "interrupt_response": True
             },
@@ -379,6 +404,20 @@ class OpenAIVoiceProvider(VoiceProvider):
             result = execute_tool(name, arguments)
             if self.on_end_call:
                 await self.on_end_call(arguments.get("reason", "user_request"))
+        elif name == "generate_car_url":
+            result = execute_tool(name, arguments)
+            if result and "url" in result and self.call_id:
+                await sse_manager.send_url(
+                    call_id=self.call_id,
+                    url=result["url"],
+                    car_slug=result.get("car_slug", ""),
+                    color=result.get("color")
+                )
+                print(f"\n{'='*60}")
+                print(f"[PROXY LINK] http://localhost:8000/car/{self.call_id}/")
+                print(f"[NGROK] https://<ngrok-domain>/car/{self.call_id}/")
+                print(f"[CAR URL] {result['url']}")
+                print(f"{'='*60}\n")
         else:
             result = execute_tool(name, arguments)
 

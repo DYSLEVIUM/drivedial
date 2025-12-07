@@ -1,8 +1,8 @@
 from django.urls import path
 
-from api.views import (CallAnalyticsView, HealthCheckView, IncomingCallView,
-                       InventoryItemView, InventoryView, PricingView,
-                       UsageView)
+from api.views import (CallAnalyticsView, CarProxyView, CarSSEView,
+                       HealthCheckView, IncomingCallView, InventoryItemView,
+                       InventoryView, PricingView, UsageView)
 
 app_name = "api"
 

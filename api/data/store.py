@@ -25,7 +25,7 @@ class InventoryStore:
 
     def remove_car(self, car_id: str) -> bool:
         for i, car in enumerate(self._inventory):
-            if car["id"] == car_id:
+            if car["slug"] == car_id:
                 removed = self._inventory.pop(i)
                 logger.info(f"Removed car: {removed['name']}")
                 return True
@@ -33,7 +33,7 @@ class InventoryStore:
 
     def update_car(self, car_id: str, updates: Dict) -> bool:
         for car in self._inventory:
-            if car["id"] == car_id:
+            if car["slug"] == car_id:
                 car.update(updates)
                 logger.info(f"Updated car: {car['name']}")
                 return True
@@ -41,7 +41,7 @@ class InventoryStore:
 
     def get_car(self, car_id: str) -> Optional[CarSpec]:
         for car in self._inventory:
-            if car["id"] == car_id:
+            if car["slug"] == car_id:
                 return car
         return None
 
@@ -55,12 +55,12 @@ class InventoryStore:
     ) -> List[CarSpec]:
         results = self._inventory.copy()
         if budget_min is not None:
-            results = [c for c in results if c["price"] >= budget_min]
+            results = [c for c in results if c["acko_price"] >= budget_min]
         if budget_max is not None:
-            results = [c for c in results if c["price"] <= budget_max]
+            results = [c for c in results if c["acko_price"] <= budget_max]
         if brand:
             results = [c for c in results if brand.lower()
-                       in c["brand"].lower()]
+                       in c["brand_name"].lower()]
         if fuel_type:
             results = [c for c in results if fuel_type.lower() ==
                        c["fuel_type"].lower()]
@@ -70,16 +70,16 @@ class InventoryStore:
         return results
 
     def search_by_brand(self, brand: str) -> List[CarSpec]:
-        return [car for car in self._inventory if brand.lower() in car["brand"].lower()]
+        return [car for car in self._inventory if brand.lower() in car["brand_name"].lower()]
 
     def get_all_brands(self) -> List[str]:
-        return list(set(car["brand"] for car in self._inventory))
+        return list(set(car["brand_name"] for car in self._inventory))
 
     def get_all_car_names(self) -> List[str]:
         return [car["name"] for car in self._inventory]
 
     def get_price_range(self) -> Tuple[int, int]:
-        prices = [car["price"] for car in self._inventory]
+        prices = [car["acko_price"] for car in self._inventory]
         return min(prices), max(prices)
 
     def get_context_summary(self) -> str:
