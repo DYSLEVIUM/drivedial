@@ -1,4 +1,5 @@
 import asyncio
+import json
 import logging
 from datetime import date
 
@@ -171,6 +172,55 @@ class CarProxyView(APIView):
     permission_classes = []
 
     def get(self, request: Request, call_id: str) -> HttpResponse:
+        # Check if session is active - return 404 if ended
+        if not sse_manager.is_session_active(call_id):
+            return HttpResponse(
+                '''<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Session Ended - Acko Drive</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { 
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: linear-gradient(135deg, #1a1a2e 0%, #16213e 50%, #0f3460 100%);
+            min-height: 100vh;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            color: white;
+        }
+        .container {
+            text-align: center;
+            padding: 40px;
+        }
+        h1 { font-size: 72px; color: #00d9ff; margin-bottom: 20px; }
+        p { font-size: 18px; color: #888; margin-bottom: 30px; }
+        a { 
+            display: inline-block;
+            background: linear-gradient(135deg, #00d9ff, #0099cc);
+            color: #000;
+            padding: 12px 24px;
+            border-radius: 8px;
+            font-weight: 600;
+            text-decoration: none;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>404</h1>
+        <p>This call session has ended.</p>
+        <a href="https://ackodrive.com">Visit Acko Drive</a>
+    </div>
+</body>
+</html>''',
+                content_type='text/html',
+                status=404
+            )
+        
         current = sse_manager.get_current_url(call_id)
         initial_url = current.url if current else ""
         
@@ -286,6 +336,11 @@ class CarProxyView(APIView):
         
         evtSource.onmessage = function(event) {{
             const data = JSON.parse(event.data);
+            if (data.type === 'session_ended') {{
+                evtSource.close();
+                showSessionEnded();
+                return;
+            }}
             if (data.url) {{
                 showCar(data.url);
             }}
@@ -293,7 +348,19 @@ class CarProxyView(APIView):
 
         evtSource.onerror = function(err) {{
             console.error('SSE error:', err);
+            // Reload page to show 404 if session ended
+            setTimeout(() => location.reload(), 1000);
         }};
+
+        function showSessionEnded() {{
+            document.body.innerHTML = `
+                <div style="display: flex; flex-direction: column; align-items: center; justify-content: center; min-height: 100vh; background: linear-gradient(135deg, #1a1a2e 0%, #16213e 50%, #0f3460 100%); color: white; text-align: center; padding: 40px;">
+                    <h1 style="font-size: 72px; color: #00d9ff; margin-bottom: 20px;">Session Ended</h1>
+                    <p style="font-size: 18px; color: #888; margin-bottom: 30px;">This call session has ended.</p>
+                    <a href="https://ackodrive.com" style="display: inline-block; background: linear-gradient(135deg, #00d9ff, #0099cc); color: #000; padding: 12px 24px; border-radius: 8px; font-weight: 600; text-decoration: none;">Visit Acko Drive</a>
+                </div>
+            `;
+        }}
     </script>
 </body>
 </html>'''
@@ -302,6 +369,14 @@ class CarProxyView(APIView):
 
 class CarSSEView(View):
     async def get(self, request, call_id: str) -> StreamingHttpResponse:
+        # Check if session is active
+        if not sse_manager.is_session_active(call_id):
+            return HttpResponse(
+                '{"error": "Session ended"}',
+                content_type='application/json',
+                status=404
+            )
+
         async def event_stream():
             queue = sse_manager.register(call_id)
             try:
@@ -309,7 +384,14 @@ class CarSSEView(View):
                     try:
                         event = await asyncio.wait_for(queue.get(), timeout=30.0)
                         yield sse_manager.to_sse_data(event)
+                        # Stop streaming if session ended
+                        if isinstance(event, dict) and event.get("type") == "session_ended":
+                            break
                     except asyncio.TimeoutError:
+                        # Check if session is still active during keepalive
+                        if not sse_manager.is_session_active(call_id):
+                            yield f"data: {json.dumps({'type': 'session_ended'})}\n\n"
+                            break
                         yield ": keepalive\n\n"
             except (asyncio.CancelledError, GeneratorExit):
                 pass
@@ -327,10 +409,17 @@ class CarSSEView(View):
 @method_decorator(csrf_exempt, name='dispatch')
 class CarTestView(View):
     async def post(self, request, call_id: str) -> HttpResponse:
-        import json
         body = json.loads(request.body) if request.body else {}
         car_slug = body.get("car_slug", "toyota-rumion-s-cng")
         color = body.get("color")
+        
+        # Check if session is active
+        if not sse_manager.is_session_active(call_id):
+            return HttpResponse(
+                json.dumps({"error": "Session not active or ended"}),
+                content_type='application/json',
+                status=404
+            )
         
         from api.data.inventory import generate_car_url
         url = generate_car_url(car_slug, color)

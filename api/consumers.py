@@ -8,6 +8,7 @@ from channels.generic.websocket import AsyncWebsocketConsumer
 
 from api.providers import ProviderFactory, VoiceProvider
 from api.services.call_logger import CallLogger
+from api.services.sse_manager import sse_manager
 
 logger = logging.getLogger("websocket")
 
@@ -25,10 +26,18 @@ class MediaStreamConsumer(AsyncWebsocketConsumer):
         await self.accept()
         self.call_id = str(uuid.uuid4())[:8]
         CallLogger.get_logger(self.call_id)
+        sse_manager.start_session(self.call_id)
+        
+        # Print proxy link for this call session
+        print(f"\n{'='*60}")
+        print(f"[NEW CALL SESSION] {self.call_id}")
+        print(f"[PROXY LINK] http://localhost:8000/car/{self.call_id}/")
+        print(f"{'='*60}\n")
 
     async def disconnect(self, close_code: int) -> None:
         if self.call_id:
             CallLogger.log_event(self.call_id, f"Disconnected: {close_code}")
+            sse_manager.end_session(self.call_id)
 
         if self._task and not self._task.done():
             self._task.cancel()
