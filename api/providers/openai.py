@@ -20,7 +20,7 @@ TOOLS: List[Dict[str, Any]] = [
     {
         "type": "function",
         "name": "search_cars",
-        "description": "Search inventory for cars. Budget: '20 lakh' = 2000000. 'under X' = budget_max only.",
+        "description": "Search inventory for cars. Budget: '20 lakh' = 2000000. 'under X' = budget_max only. Use sort_by for price sorting when user asks for cheapest/expensive options.",
         "parameters": {
             "type": "object",
             "properties": {
@@ -28,7 +28,8 @@ TOOLS: List[Dict[str, Any]] = [
                 "budget_max": {"type": "integer", "description": "Max budget INR. For 'under X', 'within X' queries."},
                 "brand": {"type": "string", "description": "Car brand"},
                 "fuel_type": {"type": "string", "enum": ["Petrol", "Diesel"]},
-                "transmission": {"type": "string", "enum": ["Manual", "Automatic", "CVT"]}
+                "transmission": {"type": "string", "enum": ["Manual", "Automatic", "CVT"]},
+                "sort_by": {"type": "string", "enum": ["price_low_to_high", "price_high_to_low"], "description": "Sort results by price. Use 'price_low_to_high' for cheapest/affordable/budget-friendly/lowest price. Use 'price_high_to_low' for expensive/premium/top-end/highest price."}
             },
             "required": []
         }
@@ -136,6 +137,7 @@ def execute_tool(name: str, arguments: dict) -> Any:
             brand=arguments.get("brand"),
             fuel_type=arguments.get("fuel_type"),
             transmission=arguments.get("transmission"),
+            sort_by=arguments.get("sort_by"),
         )
     elif name == "get_car_details":
         return store.get_car(arguments.get("car_id", ""))

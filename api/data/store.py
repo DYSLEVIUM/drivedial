@@ -52,6 +52,7 @@ class InventoryStore:
         brand: Optional[str] = None,
         fuel_type: Optional[str] = None,
         transmission: Optional[str] = None,
+        sort_by: Optional[str] = None,
     ) -> List[CarSpec]:
         results = self._inventory.copy()
         if budget_min is not None:
@@ -67,6 +68,13 @@ class InventoryStore:
         if transmission:
             results = [c for c in results if transmission.lower() ==
                        c["transmission"].lower()]
+        
+        # Sort by price if requested
+        if sort_by == "price_low_to_high":
+            results = sorted(results, key=lambda c: c["acko_price"])
+        elif sort_by == "price_high_to_low":
+            results = sorted(results, key=lambda c: c["acko_price"], reverse=True)
+        
         return results
 
     def search_by_brand(self, brand: str) -> List[CarSpec]:
