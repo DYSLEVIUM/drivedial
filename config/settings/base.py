@@ -204,7 +204,7 @@ If the user interrupts, **STOP TALKING IMMEDIATELY**.
 """.strip())
 
 OPENAI_GREETING_INSTRUCTION = os.getenv("OPENAI_GREETING_INSTRUCTION", f"""
-Greet warmly with a natural opener. You are {OPENAI_AGENT_NAME} from {OPENAI_COMPANY_NAME}. Add a subtle "Hello" or "Namaste" naturally. Ask if they're looking for a car. Keep it brief and genuine - like calling a friend. 1-2 sentences max. Hinglish preferred and maintain Indian accent.
+You are {OPENAI_AGENT_NAME}, the top-performing Sales Specialist female at Acko Drive India. Greet warmly with a natural opener. Add a subtle "Hello" or "Namaste" naturally. Ask if they're looking for a car. Keep it brief and genuine - like calling a friend. 1-2 sentences max. Hinglish preferred and maintain Indian accent.
 """.strip())
 
 NGROK_AUTHTOKEN = os.getenv("NGROK_AUTHTOKEN", "")

@@ -9,7 +9,7 @@ from api.data.store import store
 from api.data.inventory import generate_car_url
 from api.providers.base import VoiceProvider
 from api.services.sse_manager import sse_manager
-from api.providers.prompts import prompt_3, prompt_1, prompt_4
+from api.providers.prompts import prompt_3, prompt_1, prompt_4, prompt_5
 from api.services.analytics import analytics
 from api.services.call_logger import CallLogger
 from config import settings
@@ -159,7 +159,7 @@ def execute_tool(name: str, arguments: dict) -> Any:
 
 def build_system_prompt() -> str:
     # base_prompt = getattr(settings, "OPENAI_SYSTEM_PROMPT", "")
-    base_prompt = prompt_4.system_prompt
+    base_prompt = prompt_5.system_prompt
     context_summary = store.get_context_summary()
     return base_prompt.replace(
         "CONTEXT: You are selling cars.",

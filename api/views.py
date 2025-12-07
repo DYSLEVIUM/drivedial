@@ -213,7 +213,7 @@ class CarProxyView(APIView):
     <div class="container">
         <h1>404</h1>
         <p>This call session has ended.</p>
-        <a href="https://ackodrive.com">Visit Acko Drive</a>
+        <a href="https://ackodrive.com/cars/">Visit Acko Drive</a>
     </div>
 </body>
 </html>''',
@@ -357,7 +357,7 @@ class CarProxyView(APIView):
                 <div style="display: flex; flex-direction: column; align-items: center; justify-content: center; min-height: 100vh; background: linear-gradient(135deg, #1a1a2e 0%, #16213e 50%, #0f3460 100%); color: white; text-align: center; padding: 40px;">
                     <h1 style="font-size: 72px; color: #00d9ff; margin-bottom: 20px;">Session Ended</h1>
                     <p style="font-size: 18px; color: #888; margin-bottom: 30px;">This call session has ended.</p>
-                    <a href="https://ackodrive.com" style="display: inline-block; background: linear-gradient(135deg, #00d9ff, #0099cc); color: #000; padding: 12px 24px; border-radius: 8px; font-weight: 600; text-decoration: none;">Visit Acko Drive</a>
+                    <a href="https://ackodrive.com/cars/" style="display: inline-block; background: linear-gradient(135deg, #00d9ff, #0099cc); color: #000; padding: 12px 24px; border-radius: 8px; font-weight: 600; text-decoration: none;">Visit Acko Drive</a>
                 </div>
             `;
         }}
