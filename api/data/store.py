@@ -50,6 +50,7 @@ class InventoryStore:
         budget_min: Optional[int] = None,
         budget_max: Optional[int] = None,
         brand: Optional[str] = None,
+        model: Optional[str] = None,
         fuel_type: Optional[str] = None,
         transmission: Optional[str] = None,
         sort_by: Optional[str] = None,
@@ -62,6 +63,9 @@ class InventoryStore:
         if brand:
             results = [c for c in results if brand.lower()
                        in c["brand_name"].lower()]
+        if model:
+            results = [c for c in results if model.lower()
+                       in c["model_name"].lower()]
         if fuel_type:
             results = [c for c in results if fuel_type.lower() ==
                        c["fuel_type"].lower()]

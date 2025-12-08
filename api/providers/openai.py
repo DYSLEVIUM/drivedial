@@ -26,8 +26,9 @@ TOOLS: List[Dict[str, Any]] = [
             "properties": {
                 "budget_min": {"type": "integer", "description": "Min budget INR. Only for 'above X' or 'between X and Y'."},
                 "budget_max": {"type": "integer", "description": "Max budget INR. For 'under X', 'within X' queries."},
-                "brand": {"type": "string", "description": "Car brand"},
-                "fuel_type": {"type": "string", "enum": ["Petrol", "Diesel"]},
+                "brand": {"type": "string", "description": "Car brand (e.g., 'Tata', 'Maruti Suzuki', 'Honda')"},
+                "model": {"type": "string", "description": "Car model name (e.g., 'Nexon', 'Swift', 'City', 'Creta'). Use when user asks for specific model variants."},
+                "fuel_type": {"type": "string", "enum": ["Petrol", "Diesel", "CNG"]},
                 "transmission": {"type": "string", "enum": ["Manual", "Automatic", "CVT"]},
                 "sort_by": {"type": "string", "enum": ["price_low_to_high", "price_high_to_low"], "description": "Sort results by price. Use 'price_low_to_high' for cheapest/affordable/budget-friendly/lowest price. Use 'price_high_to_low' for expensive/premium/top-end/highest price."}
             },
@@ -135,6 +136,7 @@ def execute_tool(name: str, arguments: dict) -> Any:
             budget_min=arguments.get("budget_min"),
             budget_max=arguments.get("budget_max"),
             brand=arguments.get("brand"),
+            model=arguments.get("model"),
             fuel_type=arguments.get("fuel_type"),
             transmission=arguments.get("transmission"),
             sort_by=arguments.get("sort_by"),
