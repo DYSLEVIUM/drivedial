@@ -89,6 +89,7 @@ class MediaStreamConsumer(AsyncWebsocketConsumer):
                 on_interrupt=self._clear_twilio_buffer,
             )
             self.voice_provider.on_end_call = self._handle_end_call
+            self.voice_provider.on_transfer_call = self._handle_transfer_call
             await self.voice_provider.connect()
             await self.voice_provider.listen()
         except asyncio.CancelledError:
@@ -114,4 +115,13 @@ class MediaStreamConsumer(AsyncWebsocketConsumer):
         self._ending_call = True
         CallLogger.log_event(self.call_id, f"Ending call: {reason}")
         await asyncio.sleep(2.0)
+        await self.close()
+
+    async def _handle_transfer_call(self, reason: str, query_type: str) -> None:
+        if self._ending_call:
+            return
+        self._ending_call = True
+        CallLogger.log_event(self.call_id, f"Transferring call: {reason} - {query_type}")
+        # Give time for the bot to say the transfer message before ending
+        await asyncio.sleep(5.0)
         await self.close()

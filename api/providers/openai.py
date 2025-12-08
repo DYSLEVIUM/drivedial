@@ -9,7 +9,7 @@ from api.data.store import store
 from api.data.inventory import generate_car_url
 from api.providers.base import VoiceProvider
 from api.services.sse_manager import sse_manager
-from api.providers.prompts import prompt_3, prompt_1, prompt_4, prompt_5
+from api.providers.prompts import prompt_3, prompt_1, prompt_4, prompt_5, prompt_6
 from api.services.analytics import analytics
 from api.services.call_logger import CallLogger
 from config import settings
@@ -74,13 +74,26 @@ TOOLS: List[Dict[str, Any]] = [
     {
         "type": "function",
         "name": "end_call",
-        "description": "End the phone call. Use when: user wants to hang up, says goodbye, or after 3+ consecutive off-topic messages",
+        "description": "End the phone call. ONLY use when user EXPLICITLY says phrases like: 'bye', 'goodbye', 'end call', 'hang up', 'disconnect', 'talk later', 'phone rakhta hun', 'call end karo'. Do NOT end call for unclear speech or ambiguous statements.",
         "parameters": {
             "type": "object",
             "properties": {
                 "reason": {"type": "string", "description": "Reason for ending: 'user_request', 'off_topic', 'completed'"}
             },
             "required": ["reason"]
+        }
+    },
+    {
+        "type": "function",
+        "name": "transfer_to_agent",
+        "description": "Transfer the call to a human agent. Use when: 1) Customer asks about non-sales topics like EMI process, loan details, selling old car, exchange offers, insurance claims, service issues - topics outside new car sales. 2) Customer asks TWICE to speak to a human/senior/manager after you've already tried to help once. First time: pacify and offer help. Second time: transfer.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "reason": {"type": "string", "description": "Reason for transfer: 'non_sales_query', 'customer_escalation', 'technical_issue'"},
+                "query_type": {"type": "string", "description": "Brief description of what customer needs help with (e.g., 'EMI process', 'sell old car', 'exchange offer', 'wants human agent')"}
+            },
+            "required": ["reason", "query_type"]
         }
     },
     {
@@ -148,6 +161,13 @@ def execute_tool(name: str, arguments: dict) -> Any:
         return [{"name": c["name"], "waiting_period": c["waiting_period"], "is_express_delivery": c["is_express_delivery"]} for c in cars]
     elif name == "end_call":
         return {"status": "ending", "reason": arguments.get("reason", "user_request")}
+    elif name == "transfer_to_agent":
+        return {
+            "status": "transferring",
+            "reason": arguments.get("reason", "customer_escalation"),
+            "query_type": arguments.get("query_type", "general"),
+            "message": "Lead captured on high priority. Our agent will call back shortly."
+        }
     elif name == "update_car_display":
         car_slug = arguments.get("car_slug", "")
         color = arguments.get("color")
@@ -161,7 +181,7 @@ def execute_tool(name: str, arguments: dict) -> Any:
 
 def build_system_prompt() -> str:
     # base_prompt = getattr(settings, "OPENAI_SYSTEM_PROMPT", "")
-    base_prompt = prompt_5.system_prompt
+    base_prompt = prompt_6.system_prompt
     context_summary = store.get_context_summary()
     return base_prompt.replace(
         "CONTEXT: You are selling cars.",
@@ -194,6 +214,7 @@ class OpenAIVoiceProvider(VoiceProvider):
         self.on_transcript: Optional[Callable[[str, bool], None]] = None
         self.on_response_done: Optional[Callable[[], None]] = None
         self.on_end_call: Optional[Callable[[str], None]] = None
+        self.on_transfer_call: Optional[Callable[[str, str], None]] = None
 
         self._is_user_speaking = False
         self._audio_delta_count = 0
@@ -408,6 +429,13 @@ class OpenAIVoiceProvider(VoiceProvider):
             result = execute_tool(name, arguments)
             if self.on_end_call:
                 await self.on_end_call(arguments.get("reason", "user_request"))
+        elif name == "transfer_to_agent":
+            result = execute_tool(name, arguments)
+            if self.on_transfer_call:
+                await self.on_transfer_call(
+                    arguments.get("reason", "customer_escalation"),
+                    arguments.get("query_type", "general")
+                )
         elif name == "update_car_display":
             print(f"\n{'='*60}")
             print(f"[TOOL CALL] update_car_display")
