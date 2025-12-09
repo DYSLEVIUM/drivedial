@@ -9,7 +9,7 @@ from api.data.store import store
 from api.data.inventory import generate_car_url
 from api.providers.base import VoiceProvider
 from api.services.sse_manager import sse_manager
-from api.providers.prompts import prompt_3, prompt_1, prompt_4, prompt_5, prompt_6
+from api.providers.prompts import prompt_3, prompt_1, prompt_4, prompt_5, prompt_6, prompt_7
 from api.services.analytics import analytics
 from api.services.call_logger import CallLogger
 from config import settings
@@ -20,17 +20,18 @@ TOOLS: List[Dict[str, Any]] = [
     {
         "type": "function",
         "name": "search_cars",
-        "description": "Search inventory for cars. Budget: '20 lakh' = 2000000. 'under X' = budget_max only. Use sort_by for price sorting when user asks for cheapest/expensive options.",
+        "description": "Search inventory for cars. Budget conversion: '20 lakh' = 2000000. IMPORTANT: When user says 'budget is X lakh' or 'around X lakh', set budget_min to 70% of X and budget_max to X (e.g., '10 lakh budget' -> budget_min=700000, budget_max=1000000). This ensures cars CLOSE to their budget are shown, not cheap cars. Use prefer_express=true to prioritize quick delivery cars.",
         "parameters": {
             "type": "object",
             "properties": {
-                "budget_min": {"type": "integer", "description": "Min budget INR. Only for 'above X' or 'between X and Y'."},
-                "budget_max": {"type": "integer", "description": "Max budget INR. For 'under X', 'within X' queries."},
+                "budget_min": {"type": "integer", "description": "Min budget INR. For 'budget is X' use 70% of X. For 'under X' leave empty."},
+                "budget_max": {"type": "integer", "description": "Max budget INR."},
                 "brand": {"type": "string", "description": "Car brand (e.g., 'Tata', 'Maruti Suzuki', 'Honda')"},
                 "model": {"type": "string", "description": "Car model name (e.g., 'Nexon', 'Swift', 'City', 'Creta'). Use when user asks for specific model variants."},
                 "fuel_type": {"type": "string", "enum": ["Petrol", "Diesel", "CNG"]},
                 "transmission": {"type": "string", "enum": ["Manual", "Automatic", "CVT"]},
-                "sort_by": {"type": "string", "enum": ["price_low_to_high", "price_high_to_low"], "description": "Sort results by price. Use 'price_low_to_high' for cheapest/affordable/budget-friendly/lowest price. Use 'price_high_to_low' for expensive/premium/top-end/highest price."}
+                "sort_by": {"type": "string", "enum": ["price_low_to_high", "price_high_to_low", "closest_to_budget"], "description": "Sort results. Use 'closest_to_budget' when user specifies a budget (default). Use 'price_low_to_high' only when user explicitly asks for cheapest."},
+                "prefer_express": {"type": "boolean", "description": "Set true to prioritize cars with express delivery (recommended for most searches)"}
             },
             "required": []
         }
@@ -152,7 +153,8 @@ def execute_tool(name: str, arguments: dict) -> Any:
             model=arguments.get("model"),
             fuel_type=arguments.get("fuel_type"),
             transmission=arguments.get("transmission"),
-            sort_by=arguments.get("sort_by"),
+            sort_by=arguments.get("sort_by", "closest_to_budget"),  # Default to closest_to_budget
+            prefer_express=arguments.get("prefer_express", True),  # Default to prefer express
         )
     elif name == "get_car_details":
         return store.get_car(arguments.get("car_id", ""))

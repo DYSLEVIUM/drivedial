@@ -54,6 +54,7 @@ class InventoryStore:
         fuel_type: Optional[str] = None,
         transmission: Optional[str] = None,
         sort_by: Optional[str] = None,
+        prefer_express: bool = False,
     ) -> List[CarSpec]:
         results = self._inventory.copy()
         if budget_min is not None:
@@ -73,11 +74,20 @@ class InventoryStore:
             results = [c for c in results if transmission.lower() ==
                        c["transmission"].lower()]
         
-        # Sort by price if requested
+        # Sort by price/budget preference
         if sort_by == "price_low_to_high":
             results = sorted(results, key=lambda c: c["acko_price"])
         elif sort_by == "price_high_to_low":
             results = sorted(results, key=lambda c: c["acko_price"], reverse=True)
+        elif sort_by == "closest_to_budget" and budget_max:
+            # Sort by closeness to budget_max (prefer cars closer to max budget)
+            results = sorted(results, key=lambda c: abs(c["acko_price"] - budget_max))
+        
+        # Soft filter: Prioritize express delivery cars (move them to top)
+        if prefer_express:
+            express_cars = [c for c in results if c.get("is_express_delivery", False)]
+            non_express_cars = [c for c in results if not c.get("is_express_delivery", False)]
+            results = express_cars + non_express_cars
         
         return results
 
