@@ -41,7 +41,12 @@ class IncomingCallView(APIView):
         logger.info(f"Incoming call: {call_sid} from {from_number}")
 
         telephony = ProviderFactory.get_telephony()
-        twiml = telephony.generate_stream_response(host, "ws/media-stream/")
+        twiml = telephony.generate_stream_response(
+            host, 
+            "ws/media-stream/",
+            from_number=from_number,
+            call_sid=call_sid
+        )
         return HttpResponse(twiml, content_type="text/xml")
 
     def get(self, request: Request) -> Response:

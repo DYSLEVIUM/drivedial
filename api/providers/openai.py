@@ -99,7 +99,7 @@ TOOLS: List[Dict[str, Any]] = [
     {
         "type": "function",
         "name": "update_car_display",
-        "description": "Update the car display for the customer. ALWAYS call this when: 1) User shows interest in a specific car model (e.g., 'I like the Nexon', 'Tell me about Swift'), 2) User specifies preferences like color, variant, or fuel type for a car, 3) User confirms or finalizes a car choice, 4) Discussing details of a specific car. This keeps the customer's screen updated with the car being discussed.",
+        "description": "Update the car display for the customer. **ALWAYS** call this when: 1) User shows interest in a specific car model (e.g., 'I like the Nexon', 'Tell me about Swift'), 2) User specifies preferences like color, variant, or fuel type for a car, 3) User confirms or finalizes a car choice, 4) Discussing details of a specific car. This keeps the customer's screen updated with the car being discussed.",
         "parameters": {
             "type": "object",
             "properties": {
@@ -179,17 +179,23 @@ def execute_tool(name: str, arguments: dict) -> Any:
     return None
 
 
-def build_system_prompt() -> str:
+def build_system_prompt(customer_context: Optional[str] = None) -> str:
     # base_prompt = getattr(settings, "OPENAI_SYSTEM_PROMPT", "")
     base_prompt = prompt_6.system_prompt
     context_summary = store.get_context_summary()
-    return base_prompt.replace(
+    prompt = base_prompt.replace(
         "CONTEXT: You are selling cars.",
         f"CONTEXT: {context_summary}"
     ).replace(
         "CONTEXT: You are selling cars (Swift, Honda City, XUV700, Creta, Baleno).",
         f"CONTEXT: {context_summary}"
     )
+    
+    # Add returning customer context if available
+    if customer_context:
+        prompt += f"\n\n### RETURNING CUSTOMER CONTEXT\n{customer_context}\n\n**IMPORTANT**: This is a returning customer! Acknowledge them warmly, reference their previous interest, and pick up where you left off. Don't repeat basic introductions - get straight to helping them."
+    
+    return prompt
 
 
 class OpenAIVoiceProvider(VoiceProvider):
@@ -201,12 +207,15 @@ class OpenAIVoiceProvider(VoiceProvider):
         system_prompt: Optional[str] = None,
         voice: Optional[str] = None,
         call_id: Optional[str] = None,
+        customer_context: Optional[str] = None,
     ):
         self.api_key = api_key or settings.OPENAI_API_KEY
-        self.system_prompt = system_prompt or build_system_prompt()
+        self.system_prompt = system_prompt or build_system_prompt(customer_context)
         self.voice = voice or settings.OPENAI_VOICE
         self.temperature = settings.OPENAI_TEMPERATURE
         self.call_id = call_id
+        self._is_returning_customer = customer_context is not None
+        self._customer_context = customer_context
 
         self._session: Optional[aiohttp.ClientSession] = None
         self._ws: Optional[aiohttp.ClientWebSocketResponse] = None
@@ -284,11 +293,23 @@ class OpenAIVoiceProvider(VoiceProvider):
             CallLogger.log_event(self.call_id, "Session configured")
 
     async def _send_initial_greeting(self) -> None:
-        greeting_instruction = getattr(
-            settings,
-            "OPENAI_GREETING_INSTRUCTION",
-            "Greet the customer warmly. Introduce yourself and ask if they are looking for a car. Be brief and natural."
-        )
+        if self._is_returning_customer and self._customer_context:
+            # Personalized greeting for returning customers with their context
+            greeting_instruction = f"""You are Shivi, the top-performing Sales Specialist female at Acko Drive India. You remember this customer from a previous call.
+
+PREVIOUS CALL CONTEXT:
+{self._customer_context}
+
+Greet them warmly with a natural opener and acknowledge that you remember them. If you have there name, add it. Start Something like "Namaste, Mai Shivi, your car advisor from Acko Drive. Aap kaise ho?" naturally and reference something specific from their last call (like the car they were interested in, or their preferences).
+Be brief, natural, and show that you value their return. Ask how you can help them today and if they want to continue where you left off. Keep it brief and genuine. 1-2 sentences max. Hinglish preferred and maintain Indian accent."""
+        else:
+            # Standard greeting for new customers
+            greeting_instruction = getattr(
+                settings,
+                "OPENAI_GREETING_INSTRUCTION",
+                "Greet the customer warmly. Introduce yourself and ask if they are looking for a car. Be brief and natural."
+            )
+        
         await self._ws.send_json({
             "type": "response.create",
             "response": {

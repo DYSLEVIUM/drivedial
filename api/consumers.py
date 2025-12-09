@@ -8,6 +8,7 @@ from channels.generic.websocket import AsyncWebsocketConsumer
 
 from api.providers import ProviderFactory, VoiceProvider
 from api.services.call_logger import CallLogger
+from api.services.call_analyzer import call_analyzer
 from api.services.sse_manager import sse_manager
 
 logger = logging.getLogger("websocket")
@@ -18,9 +19,12 @@ class MediaStreamConsumer(AsyncWebsocketConsumer):
         super().__init__(*args, **kwargs)
         self.stream_sid: Optional[str] = None
         self.call_id: Optional[str] = None
+        self.phone_number: Optional[str] = None
+        self.twilio_call_sid: Optional[str] = None
         self.voice_provider: Optional[VoiceProvider] = None
         self._task: Optional[asyncio.Task] = None
         self._ending_call: bool = False
+        self._customer_context: Optional[str] = None
 
     async def connect(self) -> None:
         await self.accept()
@@ -51,6 +55,10 @@ class MediaStreamConsumer(AsyncWebsocketConsumer):
 
         if self.call_id:
             CallLogger.close_logger(self.call_id)
+            
+            # Analyze and save call summary in background
+            if self.phone_number:
+                asyncio.create_task(self._analyze_and_save_call())
 
     async def receive(self, text_data: str = None, bytes_data: bytes = None) -> None:
         if not text_data:
@@ -70,8 +78,27 @@ class MediaStreamConsumer(AsyncWebsocketConsumer):
             CallLogger.log_error(self.call_id, f"Error: {e}")
 
     async def _on_start(self, data: dict) -> None:
-        self.stream_sid = data.get("start", {}).get("streamSid")
+        start_data = data.get("start", {})
+        self.stream_sid = start_data.get("streamSid")
+        
+        # Extract custom parameters (phone number, call SID)
+        custom_params = start_data.get("customParameters", {})
+        self.phone_number = custom_params.get("from_number", "unknown")
+        self.twilio_call_sid = custom_params.get("call_sid")
+        
         CallLogger.log_event(self.call_id, f"Stream: {self.stream_sid}")
+        CallLogger.log_event(self.call_id, f"Phone: {self.phone_number}")
+        
+        # Check if returning customer and get context
+        if self.phone_number and self.phone_number != "unknown":
+            self._customer_context = await call_analyzer.get_customer_context(self.phone_number)
+            if self._customer_context:
+                CallLogger.log_event(self.call_id, "Returning customer detected")
+                print(f"\n{'='*60}")
+                print(f"[RETURNING CUSTOMER] {self.phone_number}")
+                print(f"[CONTEXT] {self._customer_context[:200]}...")
+                print(f"{'='*60}\n")
+        
         self._task = asyncio.create_task(self._connect_voice_provider())
 
     async def _on_media(self, data: dict) -> None:
@@ -83,7 +110,9 @@ class MediaStreamConsumer(AsyncWebsocketConsumer):
     async def _connect_voice_provider(self) -> None:
         try:
             self.voice_provider = ProviderFactory.get_voice(
-                call_id=self.call_id)
+                call_id=self.call_id,
+                customer_context=self._customer_context
+            )
             self.voice_provider.set_callbacks(
                 on_audio=self._send_audio,
                 on_interrupt=self._clear_twilio_buffer,
@@ -125,3 +154,22 @@ class MediaStreamConsumer(AsyncWebsocketConsumer):
         # Give time for the bot to say the transfer message before ending
         await asyncio.sleep(5.0)
         await self.close()
+
+    async def _analyze_and_save_call(self) -> None:
+        """Analyze call log and save summary to database."""
+        try:
+            # Small delay to ensure log file is fully written
+            await asyncio.sleep(2.0)
+            
+            analysis = await call_analyzer.analyze_call(self.call_id, self.phone_number)
+            if analysis:
+                await call_analyzer.save_analysis(analysis)
+                print(f"\n{'='*60}")
+                print(f"[CALL ANALYSIS SAVED] {self.call_id}")
+                print(f"[PHONE] {self.phone_number}")
+                print(f"[OUTCOME] {analysis.get('call_outcome')}")
+                print(f"[LEAD QUALITY] {analysis.get('lead_quality')}")
+                print(f"[SUMMARY] {analysis.get('summary', '')[:100]}...")
+                print(f"{'='*60}\n")
+        except Exception as e:
+            logger.error(f"Error analyzing call {self.call_id}: {e}")
