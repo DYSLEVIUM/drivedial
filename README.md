@@ -7,7 +7,23 @@ Modular Django voice AI with pluggable providers for telephony and voice AI.
 ```bash
 uv sync
 cp env.example .env  # Edit with your API keys
-uv run python manage.py runserver_ngrok
+uv run python scripts/run_dev.py
+```
+
+## Running with Specific Agent
+
+Run with a specific agent configuration:
+
+```bash
+# Car sales agent
+uv run python scripts/run_dev.py --agent-config configs/car_sales_agent.json
+
+# Credit card sales agent
+uv run python scripts/run_dev.py --agent-config configs/credit_card_sales_agent.json
+
+# Or set via environment variable
+export AGENT_CONFIG_PATH=configs/credit_card_sales_agent.json
+uv run python scripts/run_dev.py
 ```
 
 ## Architecture

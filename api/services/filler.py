@@ -7,6 +7,8 @@ from typing import List, Optional
 import aiohttp
 from django.conf import settings
 
+from api.config.loader import get_agent_config
+
 logger = logging.getLogger("filler")
 
 FALLBACK_FILLERS = [
@@ -35,7 +37,10 @@ class FillerGenerator:
         if self._session and not self._session.closed:
             await self._session.close()
 
-    async def get_filler(self, context: str = "cars") -> str:
+    async def get_filler(self, context: Optional[str] = None) -> str:
+        if context is None:
+            config = get_agent_config()
+            context = config.get("filler_context", "sales agent")
         async with self._cache_lock:
             if self._cache:
                 return self._cache.pop(0)
@@ -63,20 +68,24 @@ class FillerGenerator:
             headers=headers,
             json={
                 "model": self.model,
-                "messages": [{"role": "user", "content": f"Short filler for car sales agent. Context: {context}. Under 6 words. Just the text:"}],
+                "messages": [{"role": "user", "content": f"Short filler for {context}. Under 6 words. Just the text:"}],
                 "temperature": 0.7,
                 "max_tokens": 20,
             },
             timeout=aiohttp.ClientTimeout(total=1.5)
         ) as resp:
             data = await resp.json()
-            filler = data.get("choices", [{}])[0].get("message", {}).get("content", "").strip()
+            filler = data.get("choices", [{}])[0].get(
+                "message", {}).get("content", "").strip()
             return filler.strip('"\'') if filler else ""
 
     async def prefetch_cache(self, count: int = 3) -> None:
         asyncio.create_task(self._fill_cache(count))
 
     async def _fill_cache(self, count: int) -> None:
+        config = get_agent_config()
+        context = config.get("filler_context", "sales agent")
+
         session = await self._get_session()
         headers = {
             "Authorization": f"Bearer {self.api_key}",
@@ -89,7 +98,7 @@ class FillerGenerator:
                 headers=headers,
                 json={
                     "model": self.model,
-                    "messages": [{"role": "user", "content": f"Generate {count} short fillers for car sales agent. Under 6 words each. Return JSON: {{\"fillers\": [\"...\"]}}"}],
+                    "messages": [{"role": "user", "content": f"Generate {count} short fillers for {context}. Under 6 words each. Return JSON: {{\"fillers\": [\"...\"]}}"}],
                     "temperature": 0.8,
                     "max_tokens": 100,
                     "response_format": {"type": "json_object"},
@@ -97,7 +106,8 @@ class FillerGenerator:
                 timeout=aiohttp.ClientTimeout(total=3.0)
             ) as resp:
                 data = await resp.json()
-                content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
+                content = data.get("choices", [{}])[0].get(
+                    "message", {}).get("content", "")
                 parsed = json.loads(content)
                 fillers = parsed.get("fillers", [])
                 if fillers:

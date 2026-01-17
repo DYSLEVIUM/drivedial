@@ -5,6 +5,8 @@ from typing import Optional, Tuple
 import aiohttp
 from django.conf import settings
 
+from api.config.loader import get_agent_config
+
 logger = logging.getLogger("intent")
 
 
@@ -34,29 +36,11 @@ class IntentClassifier:
             "Content-Type": "application/json",
         }
 
-        prompt = f"""You are classifying customer queries for a car dealership.
+        config = get_agent_config()
+        prompt_template = config.get("intent_classification_prompt",
+                                     "You are classifying customer queries.\n\nQuery: \"{transcript}\"\n\nClassify into ONE of these:\n- FETCH: Customer wants specific data\n- CHAT: Greeting, acknowledgment, conversation\n- OFFTOPIC: Non-relevant topics\n\nRespond with ONLY one word: FETCH, CHAT, or OFFTOPIC")
 
-Query: "{transcript}"
-
-Classify into ONE of these:
-- FETCH: Customer wants specific car data - prices, specs, features, availability, comparisons, tire size, mileage, engine, dimensions, colors, variants, test drive, financing, EMI, budget queries
-- CHAT: Greeting, acknowledgment, laughter, filler words, clarification, general car conversation, or explaining concepts
-- OFFTOPIC: Query is clearly asking about non-car topics (politics, weather, personal life, other products)
-
-IMPORTANT - These are CHAT, not OFFTOPIC:
-- Laughter: "ha ha ha", "haha", "hehe" → CHAT
-- Acknowledgments: "ok", "okay", "theek hai", "accha", "hmm", "haan", "ji" → CHAT
-- Greetings: "hello", "hi", "bye", "thank you", "goodbye" → CHAT
-- Filler sounds: "uh", "um", random sounds → CHAT
-
-Examples:
-- "Ha, ha, ha, ha, ha." → CHAT (laughter)
-- "tire size kya hai?" → FETCH
-- "10 lakh budget" → FETCH
-- "thank you bye" → CHAT
-- "what is the weather?" → OFFTOPIC
-
-Respond with ONLY one word: FETCH, CHAT, or OFFTOPIC"""
+        prompt = prompt_template.format(transcript=transcript)
 
         try:
             async with session.post(

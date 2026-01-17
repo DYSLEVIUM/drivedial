@@ -5,116 +5,27 @@ from typing import Any, Callable, Dict, List, Optional
 
 import aiohttp
 
-from api.data.store import store
-from api.data.inventory import generate_car_url
 from api.providers.base import VoiceProvider
 from api.services.sse_manager import sse_manager
-from api.providers.prompts import prompt_3, prompt_1, prompt_4, prompt_5, prompt_6, prompt_7
 from api.services.analytics import analytics
 from api.services.call_logger import CallLogger
+from api.config.loader import get_agent_config
+from api.tools.registry import execute_tool
 from config import settings
 
 logger = logging.getLogger("openai")
 
-TOOLS: List[Dict[str, Any]] = [
-    {
-        "type": "function",
-        "name": "search_cars",
-        "description": "Search inventory for cars. Budget conversion: '20 lakh' = 2000000. IMPORTANT: When user says 'budget is X lakh' or 'around X lakh', set budget_min to 70% of X and budget_max to X (e.g., '10 lakh budget' -> budget_min=700000, budget_max=1000000). This ensures cars CLOSE to their budget are shown, not cheap cars. Use prefer_express=true to prioritize quick delivery cars.",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "budget_min": {"type": "integer", "description": "Min budget INR. For 'budget is X' use 70% of X. For 'under X' leave empty."},
-                "budget_max": {"type": "integer", "description": "Max budget INR."},
-                "brand": {"type": "string", "description": "Car brand (e.g., 'Tata', 'Maruti Suzuki', 'Honda')"},
-                "model": {"type": "string", "description": "Car model name (e.g., 'Nexon', 'Swift', 'City', 'Creta'). Use when user asks for specific model variants."},
-                "fuel_type": {"type": "string", "enum": ["Petrol", "Diesel", "CNG"]},
-                "transmission": {"type": "string", "enum": ["Manual", "Automatic", "CVT"]},
-                "sort_by": {"type": "string", "enum": ["price_low_to_high", "price_high_to_low", "closest_to_budget"], "description": "Sort results. Use 'closest_to_budget' when user specifies a budget (default). Use 'price_low_to_high' only when user explicitly asks for cheapest."},
-                "prefer_express": {"type": "boolean", "description": "Set true to prioritize cars with express delivery (recommended for most searches)"}
-            },
-            "required": []
-        }
-    },
-    {
-        "type": "function",
-        "name": "get_car_details",
-        "description": "Get details for a specific car by slug",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "car_id": {"type": "string", "description": "Car slug (e.g., 'maruti-suzuki-swift-lxi', 'maruti-suzuki-swift-zxi-plus-amt')"}
-            },
-            "required": ["car_id"]
-        }
-    },
-    {
-        "type": "function",
-        "name": "check_availability",
-        "description": "Check availability of cars from a brand",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "brand": {"type": "string", "description": "Brand name"}
-            },
-            "required": ["brand"]
-        }
-    },
-    {
-        "type": "function",
-        "name": "web_search",
-        "description": "Search the web for car reviews, comparisons, news, or general automotive info not in inventory",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "query": {"type": "string", "description": "Search query about cars, reviews, comparisons"}
-            },
-            "required": ["query"]
-        }
-    },
-    {
-        "type": "function",
-        "name": "end_call",
-        "description": "End the phone call. ONLY use when user EXPLICITLY says phrases like: 'bye', 'goodbye', 'end call', 'hang up', 'disconnect', 'talk later', 'phone rakhta hun', 'call end karo'. Do NOT end call for unclear speech or ambiguous statements.",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "reason": {"type": "string", "description": "Reason for ending: 'user_request', 'off_topic', 'completed'"}
-            },
-            "required": ["reason"]
-        }
-    },
-    {
-        "type": "function",
-        "name": "transfer_to_agent",
-        "description": "Transfer the call to a human agent. Use when: 1) Customer asks about non-sales topics like EMI process, loan details, selling old car, exchange offers, insurance claims, service issues - topics outside new car sales. 2) Customer asks TWICE to speak to a human/senior/manager after you've already tried to help once. First time: pacify and offer help. Second time: transfer.",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "reason": {"type": "string", "description": "Reason for transfer: 'non_sales_query', 'customer_escalation', 'technical_issue'"},
-                "query_type": {"type": "string", "description": "Brief description of what customer needs help with (e.g., 'EMI process', 'sell old car', 'exchange offer', 'wants human agent')"}
-            },
-            "required": ["reason", "query_type"]
-        }
-    },
-    {
-        "type": "function",
-        "name": "update_car_display",
-        "description": "Update the car display for the customer. **ALWAYS** call this when: 1) User shows interest in a specific car model (e.g., 'I like the Nexon', 'Tell me about Swift'), 2) User specifies preferences like color, variant, or fuel type for a car, 3) User confirms or finalizes a car choice, 4) Discussing details of a specific car. This keeps the customer's screen updated with the car being discussed.",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "car_slug": {"type": "string", "description": "Car slug identifier (e.g., 'toyota-rumion-s-cng', 'maruti-suzuki-swift-zxi-plus-amt', 'tata-nexon-creative-plus')"},
-                "color": {"type": "string", "description": "Optional color slug (e.g., 'spunky-blue', 'flame-red'). If user specifies a color, include it here."}
-            },
-            "required": ["car_slug"]
-        }
-    }
-]
+
+def get_tools() -> List[Dict[str, Any]]:
+    config = get_agent_config()
+    return config.get("tools", [])
 
 
 async def web_search(query: str) -> Dict[str, Any]:
-    """Perform web search using OpenAI's web search or fallback to a simple response."""
+    config = get_agent_config()
+    metadata = config.get("metadata", {})
+    company = metadata.get("company", "Company")
+    
     try:
         async with aiohttp.ClientSession() as session:
             headers = {
@@ -127,7 +38,7 @@ async def web_search(query: str) -> Dict[str, Any]:
                 json={
                     "model": "gpt-4o-mini",
                     "messages": [
-                        {"role": "system", "content": "You are a helpful assistant. Provide brief, factual information about cars."},
+                        {"role": "system", "content": f"You are a helpful assistant. Provide brief, factual information about {company} products and services."},
                         {"role": "user", "content": f"Brief info about: {query}"}
                     ],
                     "temperature": 0.3,
@@ -144,58 +55,30 @@ async def web_search(query: str) -> Dict[str, Any]:
         return {"result": "Could not fetch information at the moment.", "source": "error"}
 
 
-def execute_tool(name: str, arguments: dict) -> Any:
-    if name == "search_cars":
-        return store.search(
-            budget_min=arguments.get("budget_min"),
-            budget_max=arguments.get("budget_max"),
-            brand=arguments.get("brand"),
-            model=arguments.get("model"),
-            fuel_type=arguments.get("fuel_type"),
-            transmission=arguments.get("transmission"),
-            sort_by=arguments.get("sort_by", "closest_to_budget"),  # Default to closest_to_budget
-            prefer_express=arguments.get("prefer_express", True),  # Default to prefer express
-        )
-    elif name == "get_car_details":
-        return store.get_car(arguments.get("car_id", ""))
-    elif name == "check_availability":
-        cars = store.search_by_brand(arguments.get("brand", ""))
-        return [{"name": c["name"], "waiting_period": c["waiting_period"], "is_express_delivery": c["is_express_delivery"]} for c in cars]
-    elif name == "end_call":
-        return {"status": "ending", "reason": arguments.get("reason", "user_request")}
-    elif name == "transfer_to_agent":
-        return {
-            "status": "transferring",
-            "reason": arguments.get("reason", "customer_escalation"),
-            "query_type": arguments.get("query_type", "general"),
-            "message": "Lead captured on high priority. Our agent will call back shortly."
-        }
-    elif name == "update_car_display":
-        car_slug = arguments.get("car_slug", "")
-        color = arguments.get("color")
-        url = generate_car_url(car_slug, color)
-        if url:
-            return {"url": url, "car_slug": car_slug, "color": color, "status": "display_updated"}
-        else:
-            return {"error": "Could not update display. Car or color not found."}
-    return None
 
 
 def build_system_prompt(customer_context: Optional[str] = None) -> str:
-    # base_prompt = getattr(settings, "OPENAI_SYSTEM_PROMPT", "")
-    base_prompt = prompt_6.system_prompt
-    context_summary = store.get_context_summary()
-    prompt = base_prompt.replace(
-        "CONTEXT: You are selling cars.",
-        f"CONTEXT: {context_summary}"
-    ).replace(
-        "CONTEXT: You are selling cars (Swift, Honda City, XUV700, Creta, Baleno).",
-        f"CONTEXT: {context_summary}"
-    )
+    config = get_agent_config()
+    base_prompt = config.get("system_prompt", "")
     
-    # Add returning customer context if available
+    from api.data.store import store
+    if hasattr(store, 'get_context_summary'):
+        context_summary = store.get_context_summary()
+        if context_summary:
+            prompt = base_prompt.replace(
+                "CONTEXT: You are selling cars.",
+                f"CONTEXT: {context_summary}"
+            ).replace(
+                "CONTEXT: You are selling cars (Swift, Honda City, XUV700, Creta, Baleno).",
+                f"CONTEXT: {context_summary}"
+            )
+        else:
+            prompt = base_prompt
+    else:
+        prompt = base_prompt
+    
     if customer_context:
-        prompt += f"\n\n### RETURNING CUSTOMER CONTEXT\n{customer_context}\n\n**IMPORTANT**: This is a returning customer! Acknowledge them warmly, reference their previous interest, and pick up where you left off. Don't repeat basic introductions - get straight to helping them."
+        prompt += f"\n\n### DEDICATED CUSTOMER RELATIONSHIP\n{customer_context}\n\n**CRITICAL**: You are this customer's dedicated advisor. You remember everything about them from all previous calls. Reference specific details naturally throughout the conversation. Show you've been thinking about them. Use information from the keywords to make the conversation personal and relevant. Don't repeat basic introductions - you know them already. Pick up exactly where you left off."
     
     return prompt
 
@@ -211,9 +94,12 @@ class OpenAIVoiceProvider(VoiceProvider):
         call_id: Optional[str] = None,
         customer_context: Optional[str] = None,
     ):
+        config = get_agent_config()
+        metadata = config.get("metadata", {})
+        
         self.api_key = api_key or settings.OPENAI_API_KEY
         self.system_prompt = system_prompt or build_system_prompt(customer_context)
-        self.voice = voice or settings.OPENAI_VOICE
+        self.voice = voice or metadata.get("voice") or settings.OPENAI_VOICE
         self.temperature = settings.OPENAI_TEMPERATURE
         self.call_id = call_id
         self._is_returning_customer = customer_context is not None
@@ -280,7 +166,7 @@ class OpenAIVoiceProvider(VoiceProvider):
                 "create_response": True,
                 "interrupt_response": True
             },
-            "tools": TOOLS,
+            "tools": get_tools(),
             "tool_choice": "auto",
             "temperature": self.temperature,
             "max_response_output_tokens": 1000,
@@ -295,22 +181,24 @@ class OpenAIVoiceProvider(VoiceProvider):
             CallLogger.log_event(self.call_id, "Session configured")
 
     async def _send_initial_greeting(self) -> None:
+        config = get_agent_config()
+        metadata = config.get("metadata", {})
+        agent_name = metadata.get("name", "Agent")
+        company = metadata.get("company", "Company")
+        
         if self._is_returning_customer and self._customer_context:
-            # Personalized greeting for returning customers with their context
-            greeting_instruction = f"""You are Shivi, the top-performing Sales Specialist female at Acko Drive India. You remember this customer from a previous call.
+            greeting_instruction = f"""You are {agent_name}, the dedicated Sales Specialist at {company} India. You have been managing this customer's account and remember all your previous conversations with them.
 
-PREVIOUS CALL CONTEXT:
+CUSTOMER RELATIONSHIP CONTEXT:
 {self._customer_context}
 
-Greet them warmly with a natural opener and acknowledge that you remember them. If you have there name, add it. Start Something like "Namaste, Mai Shivi, your car advisor from Acko Drive. Aap kaise ho?" naturally and reference something specific from their last call (like the car they were interested in, or their preferences).
-Be brief, natural, and show that you value their return. Ask how you can help them today and if they want to continue where you left off. Keep it brief and genuine. 1-2 sentences max. Hinglish preferred and maintain Indian accent."""
+You are their dedicated advisor - you think about them, remember important details, and always pick up where you left off. Greet them warmly and naturally reference something specific from your relationship history. Use their name if you know it. Show that you've been thinking about them and their needs.
+
+Start something like "Namaste [Name]! Mai {agent_name} - aapke dedicated advisor from {company}. Aap kaise ho? Maine socha tha aapko call karun..." and naturally reference something from the context above.
+
+Be brief, natural, warm, and show genuine care. 1-2 sentences max. ALWAYS speak in Hinglish and maintain Indian accent."""
         else:
-            # Standard greeting for new customers
-            greeting_instruction = getattr(
-                settings,
-                "OPENAI_GREETING_INSTRUCTION",
-                "Greet the customer warmly. Introduce yourself and ask if they are looking for a car. Be brief and natural."
-            )
+            greeting_instruction = config.get("greeting_instruction", "Greet the customer warmly. Introduce yourself and ask how you can help. Be brief and natural.")
         
         await self._ws.send_json({
             "type": "response.create",
@@ -448,24 +336,21 @@ Be brief, natural, and show that you value their return. Ask how you can help th
 
         if name == "web_search":
             result = await web_search(arguments.get("query", ""))
-        elif name == "end_call":
+        else:
             result = execute_tool(name, arguments)
-            if self.on_end_call:
+            
+            if name == "end_call" and self.on_end_call:
                 await self.on_end_call(arguments.get("reason", "user_request"))
-        elif name == "transfer_to_agent":
-            result = execute_tool(name, arguments)
-            if self.on_transfer_call:
+            elif name == "transfer_to_agent" and self.on_transfer_call:
                 await self.on_transfer_call(
                     arguments.get("reason", "customer_escalation"),
                     arguments.get("query_type", "general")
                 )
-        elif name == "update_car_display":
+        
+        if result and ("display" in name.lower() or "update" in name.lower()):
             print(f"\n{'='*60}")
-            print(f"[TOOL CALL] update_car_display")
-            print(f"[ARGUMENTS] car_slug: {arguments.get('car_slug', 'N/A')} | color: {arguments.get('color', 'N/A')}")
-            
-            result = execute_tool(name, arguments)
-            
+            print(f"[TOOL CALL] {name}")
+            print(f"[ARGUMENTS] {json.dumps(arguments, indent=2)}")
             print(f"[TOOL RESULT] {json.dumps(result, indent=2)}")
             
             if result and "url" in result and self.call_id:
@@ -473,19 +358,17 @@ Be brief, natural, and show that you value their return. Ask how you can help th
                 await sse_manager.send_url(
                     call_id=self.call_id,
                     url=result["url"],
-                    car_slug=result.get("car_slug", ""),
+                    car_slug=result.get("car_slug") or result.get("card_id") or result.get("item_id", ""),
                     color=result.get("color")
                 )
                 print(f"[SSE] Event pushed successfully!")
-                print(f"[PROXY LINK] http://localhost:8000/car/{self.call_id}/")
-                print(f"[CAR URL] {result['url']}")
+                print(f"[PROXY LINK] http://localhost:8000/item/{self.call_id}/")
+                print(f"[URL] {result['url']}")
             elif result and "error" in result:
                 print(f"[ERROR] {result['error']}")
             else:
                 print(f"[ERROR] No URL generated - result: {result}")
             print(f"{'='*60}\n")
-        else:
-            result = execute_tool(name, arguments)
 
         result_str = json.dumps(
             result, ensure_ascii=False) if result is not None else "No results found"

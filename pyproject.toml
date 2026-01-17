@@ -12,6 +12,7 @@ dependencies = [
     "django>=4.2.0",
     "django-cors-headers>=4.0.0",
     "djangorestframework>=3.14.0",
+    "ipdb>=0.13.13",
     "pyngrok>=7.0.0",
     "python-dotenv>=1.0.0",
     "structlog>=24.0.0",

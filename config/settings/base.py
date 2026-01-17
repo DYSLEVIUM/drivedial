@@ -214,4 +214,34 @@ Keep the delivery smooth, human, and genuine.
 
 NGROK_AUTHTOKEN = os.getenv("NGROK_AUTHTOKEN", "")
 
+AGENT_CONFIG_PATH = os.getenv("AGENT_CONFIG_PATH", "")
+
+if AGENT_CONFIG_PATH:
+    try:
+        from api.config.loader import load_agent_config
+        config = load_agent_config(AGENT_CONFIG_PATH)
+        agent_type = config.get("agent_type", "")
+
+        from api.tools.common_tools import (end_call_handler,
+                                            transfer_to_agent_handler)
+        from api.tools.registry import register_tool_handler
+
+        register_tool_handler("end_call", end_call_handler)
+        register_tool_handler("transfer_to_agent", transfer_to_agent_handler)
+
+        if agent_type == "car_sales":
+            from api.tools.car_tools import (check_availability_handler,
+                                             get_car_details_handler,
+                                             search_cars_handler,
+                                             update_car_display_handler)
+            register_tool_handler("search_cars", search_cars_handler)
+            register_tool_handler("get_car_details", get_car_details_handler)
+            register_tool_handler("check_availability",
+                                  check_availability_handler)
+            register_tool_handler("update_car_display",
+                                  update_car_display_handler)
+    except Exception as e:
+        import warnings
+        warnings.warn(f"Failed to load agent config: {e}")
+
 (BASE_DIR / "logs").mkdir(exist_ok=True)

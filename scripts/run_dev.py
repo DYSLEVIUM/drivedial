@@ -37,9 +37,28 @@ def main():
     parser = argparse.ArgumentParser(description="Run DriveDial dev server")
     parser.add_argument("--port", "-p", type=int, default=8000)
     parser.add_argument("--no-ngrok", action="store_true")
+    parser.add_argument(
+        "--agent-config",
+        "-a",
+        type=str,
+        help="Path to agent config file (e.g., configs/car_sales_agent.json or configs/credit_card_sales_agent.json)"
+    )
     args = parser.parse_args()
 
     print("\n🚗 DriveDial - AI Voice Sales Agent\n")
+
+    if args.agent_config:
+        config_path = Path(PROJECT_ROOT / args.agent_config)
+        if not config_path.exists():
+            print(f"❌ Error: Config file not found: {config_path}")
+            sys.exit(1)
+        os.environ["AGENT_CONFIG_PATH"] = str(config_path.resolve())
+        print(f"📋 Using agent config: {config_path}")
+    elif not os.getenv("AGENT_CONFIG_PATH"):
+        default_config = PROJECT_ROOT / "configs" / "car_sales_agent.json"
+        if default_config.exists():
+            os.environ["AGENT_CONFIG_PATH"] = str(default_config.resolve())
+            print(f"📋 Using default agent config: {default_config}")
 
     if not args.no_ngrok:
         start_ngrok(args.port)
