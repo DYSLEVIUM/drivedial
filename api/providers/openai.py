@@ -12,6 +12,7 @@ from api.services.sse_manager import sse_manager
 from api.providers.prompts import prompt_3, prompt_1, prompt_4, prompt_5, prompt_6, prompt_7
 from api.services.analytics import analytics
 from api.services.call_logger import CallLogger
+from api.services.token_tracker import token_tracker, ModelType
 from config import settings
 
 logger = logging.getLogger("openai")
@@ -113,8 +114,14 @@ TOOLS: List[Dict[str, Any]] = [
 ]
 
 
-async def web_search(query: str) -> Dict[str, Any]:
-    """Perform web search using OpenAI's web search or fallback to a simple response."""
+async def web_search(query: str, call_id: Optional[str] = None) -> Dict[str, Any]:
+    """
+    Perform web search using OpenAI's web search or fallback to a simple response.
+    
+    Args:
+        query: The search query
+        call_id: Optional call ID for token tracking
+    """
     try:
         async with aiohttp.ClientSession() as session:
             headers = {
@@ -136,6 +143,17 @@ async def web_search(query: str) -> Dict[str, Any]:
                 timeout=aiohttp.ClientTimeout(total=5.0)
             ) as resp:
                 data = await resp.json()
+                
+                # Track token usage
+                if call_id and "usage" in data:
+                    token_tracker.record_chat_completion(
+                        call_id=call_id,
+                        model_type=ModelType.WEB_SEARCH,
+                        model_name="gpt-4o-mini",
+                        usage=data["usage"],
+                        context=query[:100],  # Truncate query for context
+                    )
+                
                 content = data.get("choices", [{}])[0].get(
                     "message", {}).get("content", "")
                 return {"result": content, "source": "web_search"}
@@ -447,7 +465,7 @@ Be brief, natural, and show that you value their return. Ask how you can help th
                 self.call_id, f"Tool: {name}", json.dumps(arguments))
 
         if name == "web_search":
-            result = await web_search(arguments.get("query", ""))
+            result = await web_search(arguments.get("query", ""), call_id=self.call_id)
         elif name == "end_call":
             result = execute_tool(name, arguments)
             if self.on_end_call:
@@ -521,17 +539,32 @@ Be brief, natural, and show that you value their return. Ask how you can help th
             return
         usage = data.get("response", {}).get("usage", {})
         if usage:
+            input_details = usage.get("input_token_details", {})
+            output_details = usage.get("output_token_details", {})
+            
             tokens = {
-                "text_input": usage.get("input_token_details", {}).get("text_tokens", 0),
-                "text_output": usage.get("output_token_details", {}).get("text_tokens", 0),
-                "audio_input": usage.get("input_token_details", {}).get("audio_tokens", 0),
-                "audio_output": usage.get("output_token_details", {}).get("audio_tokens", 0),
+                "text_input": input_details.get("text_tokens", 0),
+                "text_output": output_details.get("text_tokens", 0),
+                "audio_input": input_details.get("audio_tokens", 0),
+                "audio_output": output_details.get("audio_tokens", 0),
+                "cached_tokens": input_details.get("cached_tokens", 0),
+                "total_input": usage.get("input_tokens", 0),
+                "total_output": usage.get("output_tokens", 0),
             }
             CallLogger.log_tokens(self.call_id, "voice_agent", tokens)
+            
+            # Record in analytics (legacy)
             analytics.record_response_agent_usage(
                 self.call_id,
                 text_input=tokens["text_input"],
                 text_output=tokens["text_output"],
                 audio_input=tokens["audio_input"],
                 audio_output=tokens["audio_output"],
+            )
+            
+            # Record in TokenTracker (comprehensive)
+            token_tracker.record_voice_agent_usage(
+                call_id=self.call_id,
+                usage=usage,
+                model_name=settings.OPENAI_MODEL,
             )

@@ -43,10 +43,17 @@ class Command(BaseCommand):
         self.stdout.write("Starting ngrok tunnel...")
         tunnel = ngrok.connect(port, "http")
         url = tunnel.public_url
+        
+        # Convert http to wss for WebSocket URL
+        ws_url = url.replace("https://", "wss://").replace("http://", "ws://")
 
         self.stdout.write(self.style.SUCCESS(f"\n🌐 Public URL: {url}"))
         self.stdout.write(
-            f"📋 Twilio webhook: {url}/api/incoming-call/ (POST)\n")
+            f"📋 Twilio webhook: {url}/api/incoming-call/ (POST)")
+        self.stdout.write(
+            f"📋 Ozonetel webhook: {url}/api/ozonetel-start/ (GET/POST)")
+        self.stdout.write(
+            f"🔌 Ozonetel WebSocket: {ws_url}/ws/ozonetel-stream/\n")
         return tunnel
 
     def _run_daphne(self, port: str, tunnel):

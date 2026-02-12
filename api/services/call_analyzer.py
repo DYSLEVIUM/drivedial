@@ -9,6 +9,8 @@ from typing import Any, Dict, Optional
 import aiohttp
 from django.conf import settings
 
+from api.services.token_tracker import token_tracker, ModelType
+
 logger = logging.getLogger("call_analyzer")
 
 
@@ -107,7 +109,7 @@ IMPORTANT:
         duration = self._calculate_duration(log_content)
         
         try:
-            analysis = await self._call_gpt(conversation)
+            analysis = await self._call_gpt(conversation, call_id=call_id)
             if analysis:
                 analysis['call_id'] = call_id
                 analysis['phone_number'] = phone_number
@@ -136,8 +138,14 @@ IMPORTANT:
             'call_duration_seconds': self._calculate_duration(log_content),
         }
     
-    async def _call_gpt(self, conversation: str) -> Optional[Dict[str, Any]]:
-        """Call GPT to analyze the conversation."""
+    async def _call_gpt(self, conversation: str, call_id: Optional[str] = None) -> Optional[Dict[str, Any]]:
+        """
+        Call GPT to analyze the conversation.
+        
+        Args:
+            conversation: The conversation text to analyze
+            call_id: Optional call ID for token tracking
+        """
         prompt = self.ANALYSIS_PROMPT.format(log_content=conversation[:8000])  # Limit content
         
         async with aiohttp.ClientSession() as session:
@@ -167,6 +175,17 @@ IMPORTANT:
                     return None
                 
                 data = await resp.json()
+                
+                # Track token usage for call analysis
+                if call_id and "usage" in data:
+                    token_tracker.record_chat_completion(
+                        call_id=call_id,
+                        model_type=ModelType.CALL_ANALYSIS,
+                        model_name="gpt-4o-mini",
+                        usage=data["usage"],
+                        context="post_call_analysis",
+                    )
+                
                 content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
                 
                 try:

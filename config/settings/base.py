@@ -116,8 +116,31 @@ REST_FRAMEWORK = {
     "EXCEPTION_HANDLER": "api.exceptions.custom_exception_handler",
 }
 
+# Provider Configuration
+# VOICE_PROVIDER: 'openai' (default)
+# TELEPHONY_PROVIDER: 'twilio' (default), 'ozonetel'
 VOICE_PROVIDER = os.getenv("VOICE_PROVIDER", "openai")
 TELEPHONY_PROVIDER = os.getenv("TELEPHONY_PROVIDER", "twilio")
+
+# Telephony Route Mapping
+# Maps WebSocket route names to provider names
+# This allows multiple providers to be used simultaneously via different endpoints
+TELEPHONY_ROUTE_MAPPING = {
+    "twilio": "twilio",
+    "ozonetel": "ozonetel",
+    "media-stream": os.getenv("TELEPHONY_PROVIDER", "twilio"),  # Default route
+    "twilio-stream": "twilio",
+    "ozonetel-stream": "ozonetel",
+}
+
+# Ozonetel Configuration
+OZONETEL_API_KEY = os.getenv("OZONETEL_API_KEY", "")
+OZONETEL_SIP_NUMBER = os.getenv("OZONETEL_SIP_NUMBER", "")
+
+# Gemini Configuration (Google)
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.0-flash-live-001")
+GEMINI_VOICE = os.getenv("GEMINI_VOICE", "Kore")  # Puck, Charon, Kore, Fenrir, Aoede
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 OPENAI_MODEL = os.getenv(
@@ -206,11 +229,19 @@ If the user interrupts, **STOP TALKING IMMEDIATELY**.
 OPENAI_GREETING_INSTRUCTION = os.getenv("OPENAI_GREETING_INSTRUCTION", f"""
 You are {OPENAI_AGENT_NAME}, the top-performing female Sales Specialist at AckoDrive India. Speak in a warm, natural, conversational Hinglish tone with an Indian accent. Avoid robotic pauses or unnatural breaks. 
 Use only subtle, natural micro-pauses where a real person would breathe.
-Greet the user warmly with a simple “Hello” or “Namaste,” clearly mention your name and that you’re calling from AckoDrive. 
+Greet the user warmly with a simple "Hello" or "Namaste," clearly mention your name and that you're calling from AckoDrive. 
 Briefly (**in 1 sentences of max 25 words**) introduce your purpose and a quick line about AckoDrive—natural, friendly, not scripted.
 Then ask casually if they are looking to buy a car.
 Keep the delivery smooth, human, and genuine.
 (AckoDrive has sold more than 40,000 cars.)""".strip())
+
+GEMINI_GREETING_INSTRUCTION = os.getenv("GEMINI_GREETING_INSTRUCTION", f"""
+You are {OPENAI_AGENT_NAME}, the top-performing female Sales Specialist at AckoDrive India. Speak in a warm, natural, conversational Hinglish tone. 
+Greet the user warmly with "Hello" or "Namaste," clearly mention your name and that you're calling from AckoDrive.
+Briefly introduce your purpose and ask casually if they are looking to buy a car.
+Keep the delivery smooth, human, and genuine. 1-2 sentences max.
+(AckoDrive has sold more than 40,000 cars.)""".strip())
+
 
 NGROK_AUTHTOKEN = os.getenv("NGROK_AUTHTOKEN", "")
 

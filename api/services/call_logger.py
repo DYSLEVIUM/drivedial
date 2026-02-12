@@ -120,7 +120,7 @@ class CallLogger:
 
     @classmethod
     def log_error(cls, call_id: str, error: str) -> None:
-        cls._log_async(call_id, "error", f"[ERROR] {error}")
+        cls._log_async(call_id, "error", f"[ERROR_] {error}")
 
     @classmethod
     def log_latency(cls, call_id: str, latency_ms: float) -> None:
@@ -129,3 +129,20 @@ class CallLogger:
     @classmethod
     def log_tokens(cls, call_id: str, agent: str, tokens: Dict) -> None:
         cls._log_async(call_id, "debug", f"[TOKENS] {agent}: {tokens}")
+
+    @classmethod
+    def log_token_analysis_final(cls, call_id: str, analysis_string: str) -> None:
+        """
+        Log the final comprehensive token analysis.
+        
+        This is logged synchronously to ensure it's written before the log file is closed.
+        The analysis_string should be pre-formatted from TokenTracker.
+        """
+        if call_id not in cls._loggers:
+            return
+        
+        logger = cls._loggers[call_id]
+        
+        # Log each line of the analysis
+        for line in analysis_string.split('\n'):
+            logger.info(line)

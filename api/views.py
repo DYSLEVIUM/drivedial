@@ -30,29 +30,40 @@ class HealthCheckView(APIView):
 
 
 class IncomingCallView(APIView):
+    """
+    Handle incoming calls from telephony providers.
+    
+    Uses the configured TELEPHONY_PROVIDER to generate appropriate response.
+    For Twilio: Returns TwiML to initiate WebSocket streaming
+    For Ozonetel: Returns KooKoo XML to initiate WebSocket streaming
+    """
     authentication_classes = []
     permission_classes = []
 
     def post(self, request: Request) -> HttpResponse:
         host = request.get_host()
+        
+        # Extract call info (Twilio format)
         call_sid = request.data.get("CallSid", "unknown")
         from_number = request.data.get("From", "unknown")
 
         logger.info(f"Incoming call: {call_sid} from {from_number}")
 
         telephony = ProviderFactory.get_telephony()
-        twiml = telephony.generate_stream_response(
+        response_xml = telephony.generate_stream_response(
             host, 
             "ws/media-stream/",
             from_number=from_number,
             call_sid=call_sid
         )
-        return HttpResponse(twiml, content_type="text/xml")
+        return HttpResponse(response_xml, content_type="text/xml")
 
     def get(self, request: Request) -> Response:
+        telephony = ProviderFactory.get_telephony()
         return Response({
             "endpoint": "incoming-call",
             "method": "POST",
+            "provider": telephony.provider_name,
             "websocket": f"wss://{request.get_host()}/ws/media-stream/",
         })
 
@@ -449,3 +460,164 @@ class CarTestView(View):
             }),
             content_type='application/json'
         )
+
+
+
+class OzonetelIncomingCallView(APIView):
+    """
+    Handle incoming calls specifically from Ozonetel.
+    
+    Returns KooKoo XML to initiate bi-directional WebSocket streaming.
+    This endpoint handles different Ozonetel events:
+    - NewCall: Initial call setup - return stream XML to start WebSocket
+    - Stream: Polling while call is active - return continue/hangup based on status
+    - Hangup: Call ended - acknowledge
+    
+    Query Parameters from Ozonetel:
+    - event: NewCall, Stream, Hangup
+    - sid: Session ID
+    - cid: Caller ID
+    - status: not_answered, answered, etc.
+    - called_number: The number being called
+    """
+    authentication_classes = []
+    permission_classes = []
+
+    def _handle_ozonetel_request(self, request: Request) -> HttpResponse:
+        """Common handler for GET and POST requests."""
+        # Get host from X-Forwarded-Host (for ngrok/proxies) or fallback to Host header
+        host = request.META.get('HTTP_X_FORWARDED_HOST') or request.get_host()
+        
+        # Determine WebSocket protocol based on X-Forwarded-Proto or scheme
+        forwarded_proto = request.META.get('HTTP_X_FORWARDED_PROTO', '')
+        is_secure = forwarded_proto == 'https' or request.is_secure()
+        ws_protocol = "wss" if is_secure else "ws"
+        
+        # Extract parameters from either query params (GET) or data (POST)
+        params = request.query_params if request.method == "GET" else request.data
+        
+        event = params.get("event", "")
+        sid = params.get("sid", "")
+        cid = params.get("cid", "")
+        called_number = params.get("called_number", "")
+        status = params.get("status", "")
+        message = params.get("message", "")
+        
+        # Get configured SIP number for streaming
+        sip_number = getattr(settings, "OZONETEL_SIP_NUMBER", "")
+        
+        logger.info(
+            f"Ozonetel {event}: sid={sid}, cid={cid}, status={status}, "
+            f"message={message}, called={called_number}, host={host}, proto={ws_protocol}"
+        )
+
+        telephony = ProviderFactory.get_telephony("ozonetel")
+        
+        if event == "NewCall":
+            # Initial call - return stream XML to initiate WebSocket
+            ws_url = f"{ws_protocol}://{host}/ws/ozonetel-stream/"
+            logger.info(f"Ozonetel NewCall: Starting WebSocket stream for sid={sid}, URL={ws_url}")
+            response_xml = telephony.generate_stream_response(
+                host, 
+                "ws/ozonetel-stream/",
+                protocol=ws_protocol,
+                sip_number=sip_number,
+                is_sip=True
+            )
+            logger.info(f"Ozonetel response XML: {response_xml}")
+            return HttpResponse(response_xml, content_type="application/xml")
+        
+        elif event == "Stream":
+            # Polling during call - check status
+            if status == "not_answered":
+                # Call still ringing, continue waiting
+                # Return empty response or collectdtmf to keep IVR active
+                response_xml = '''<?xml version="1.0" encoding="UTF-8"?>
+<response>
+    <collectdtmf l="1" t="1"/>
+</response>'''
+            elif status == "answered":
+                # Call answered - this shouldn't happen during streaming
+                # Return stream XML in case it's needed
+                response_xml = telephony.generate_stream_response(
+                    host, 
+                    "ws/ozonetel-stream/",
+                    sip_number=sip_number,
+                    is_sip=True
+                )
+            else:
+                # Unknown status, return empty response
+                response_xml = '''<?xml version="1.0" encoding="UTF-8"?>
+<response/>'''
+            return HttpResponse(response_xml, content_type="application/xml")
+        
+        elif event == "Hangup":
+            # Call ended - acknowledge
+            logger.info(f"Ozonetel Hangup: sid={sid}, status={status}")
+            response_xml = '''<?xml version="1.0" encoding="UTF-8"?>
+<response/>'''
+            return HttpResponse(response_xml, content_type="application/xml")
+        
+        else:
+            # Unknown event - return stream XML as default (backward compat)
+            logger.warning(f"Ozonetel unknown event: {event}")
+            response_xml = telephony.generate_stream_response(
+                host, 
+                "ws/ozonetel-stream/",
+                sip_number=sip_number,
+                is_sip=True
+            )
+            return HttpResponse(response_xml, content_type="application/xml")
+
+    def get(self, request: Request) -> HttpResponse:
+        """Handle GET request from Ozonetel IVR."""
+        event = request.GET.get('event')
+        if event != 'NewCall':
+            response_xml = "<response> <hangup/> </response> "
+            return HttpResponse(response_xml, content_type="application/xml")
+        return self._handle_ozonetel_request(request)
+    
+    def post(self, request: Request) -> HttpResponse:
+        """Handle POST request from Ozonetel IVR."""
+        return self._handle_ozonetel_request(request)
+
+
+# Backward compatibility alias
+Ozonetel = OzonetelIncomingCallView
+
+
+class OzonetelDebugView(APIView):
+    """Debug view to test Ozonetel XML response generation."""
+    authentication_classes = []
+    permission_classes = []
+
+    def get(self, request: Request) -> Response:
+        """Show what XML response would be sent to Ozonetel."""
+        host = request.META.get('HTTP_X_FORWARDED_HOST') or request.get_host()
+        forwarded_proto = request.META.get('HTTP_X_FORWARDED_PROTO', '')
+        is_secure = forwarded_proto == 'https' or request.is_secure()
+        ws_protocol = "wss" if is_secure else "ws"
+        
+        sip_number = getattr(settings, "OZONETEL_SIP_NUMBER", "")
+        
+        telephony = ProviderFactory.get_telephony("ozonetel")
+        response_xml = telephony.generate_stream_response(
+            host,
+            "ws/ozonetel-stream/",
+            protocol=ws_protocol,
+            sip_number=sip_number,
+            is_sip=True
+        )
+        
+        return Response({
+            "host": host,
+            "protocol": ws_protocol,
+            "sip_number": sip_number or "(not configured)",
+            "websocket_url": f"{ws_protocol}://{host}/ws/ozonetel-stream/",
+            "xml_response": response_xml,
+            "request_headers": {
+                "Host": request.META.get('HTTP_HOST', ''),
+                "X-Forwarded-Host": request.META.get('HTTP_X_FORWARDED_HOST', ''),
+                "X-Forwarded-Proto": request.META.get('HTTP_X_FORWARDED_PROTO', ''),
+            }
+        })

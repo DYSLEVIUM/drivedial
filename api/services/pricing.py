@@ -18,7 +18,18 @@ class PricingService:
         return cls._instance
 
     def _init_default_pricing(self) -> None:
+        """
+        Initialize default pricing for all supported models.
+        
+        Pricing is per token in USD.
+        Source: OpenAI Pricing Page (as of 2025)
+        
+        Model Types:
+        - Realtime API: text_input, text_output, audio_input, audio_output + cached variants
+        - Chat Completions: text_input, text_output + cached variants
+        """
         self._pricing_cache = {
+            # GPT-4o Mini Realtime (Voice Agent)
             "gpt-4o-mini-realtime-preview-2024-12-17": {
                 "text_input": 0.60 / 1_000_000,
                 "text_output": 2.40 / 1_000_000,
@@ -27,6 +38,7 @@ class PricingService:
                 "text_input_cached": 0.30 / 1_000_000,
                 "audio_input_cached": 0.60 / 1_000_000,
             },
+            # GPT-4o Realtime (Higher quality voice)
             "gpt-4o-realtime-preview-2024-12-17": {
                 "text_input": 5.00 / 1_000_000,
                 "text_output": 20.00 / 1_000_000,
@@ -35,15 +47,21 @@ class PricingService:
                 "text_input_cached": 2.50 / 1_000_000,
                 "audio_input_cached": 20.00 / 1_000_000,
             },
+            # GPT-4o Mini (Used for web_search, call_analysis)
             "gpt-4o-mini": {
                 "text_input": 0.15 / 1_000_000,
                 "text_output": 0.60 / 1_000_000,
                 "text_input_cached": 0.075 / 1_000_000,
             },
+            # GPT-4o (Higher quality analysis)
             "gpt-4o": {
                 "text_input": 2.50 / 1_000_000,
                 "text_output": 10.00 / 1_000_000,
                 "text_input_cached": 1.25 / 1_000_000,
+            },
+            # GPT-4o Transcribe (included in realtime pricing, listed for reference)
+            "gpt-4o-transcribe": {
+                "audio_input": 0,  # Included in realtime audio_input
             },
         }
 
