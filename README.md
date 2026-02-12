@@ -160,7 +160,7 @@ class MyVoiceProvider(VoiceProvider):
 Register in factory:
 
 ```python
-from api.providers.my_voice import MyVoiceProvider
+    from api.providers.my_voice import MyVoiceProvider
 register_voice_provider("my_voice", MyVoiceProvider)
 ```
 

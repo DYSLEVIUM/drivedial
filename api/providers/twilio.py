@@ -70,7 +70,7 @@ class TwilioProvider(TelephonyProvider):
 <Response>
     <Hangup />
 </Response>'''
-    
+
     # WebSocket Message Parsing
     def parse_message(self, data: Dict[str, Any]) -> Optional[str]:
         """

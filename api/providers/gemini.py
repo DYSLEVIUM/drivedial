@@ -26,31 +26,53 @@ Architecture:
                                                     │ session.receive │
                                                     └────┬───────┬────┘
                                                          │       │
-                         audio (non-blocking put) ───────┘       └──── tool_call
-                                                         │
-                                                         ▼
-                                                    ┌────────────────┐
-                                                    │  _audio_out_q  │   ◂── cleared INSTANTLY
-                                                    │  (no maxsize)  │       on interruption
-                                                    └───────┬────────┘
-                                                            │
-                                                            ▼
-                                                    ┌─────────────────┐
-                                                    │ _play_audio_loop│
-                                                    │ on_audio(ulaw)  │──────▸ Telephony (Twilio)
-                                                    └─────────────────┘
+               pcm8k (non-blocking put) ─────────────────┘       └──── tool_call
+                                                         │                   │
+                                                         ▼              start keyboard
+                                                    ┌────────────────┐      │
+                                                    │  _audio_out_q  │      │
+                                                    │  RAW PCM 8kHz  │      │
+                                                    │  (no maxsize)  │      │
+                                                    └───────┬────────┘      │
+                                                            │               │
+                                                            ▼               │
+                                                    ┌─────────────────────┐ │
+                                                    │  _play_audio_loop   │ │
+                                                    │                     │ │
+                                                    │  Voice in queue?    │ │
+                                                    │  YES → mix(pcm)    │ │
+                                                    │  NO  → idle_chunk  │◂┘ keyboard in
+                                                    │        (20ms tmout)│    idle frames
+                                                    │  + office hum      │
+                                                    │  + keyboard (opt)  │
+                                                    │  → pcm→μ-law      │──▸ Telephony
+                                                    └─────────────────────┘
+
+Soundscape mixing (see soundscape.py):
+  All mixing is done in LINEAR PCM16 at 8 kHz, BEFORE μ-law encoding.
+  This prevents non-linear distortion artifacts.
+
+  Pipeline:  Gemini PCM24k → pcm24k_to_pcm8k() → _audio_out_q
+             → mixer.mix() [+office +keyboard] → pcm8k_to_g711_ulaw()
+             → on_audio() → Telephony
+
+  Continuous ambience: _ambient_fill_loop runs independently at 20ms
+  intervals.  After a 60ms grace period (no voice chunks), it sends
+  ambient-only frames to telephony.  During voice playback, the grace
+  period keeps it silent — zero interference.  During tool calls,
+  keyboard_active=True makes idle frames include click sounds.
 
 Interruption flow (< 50ms):
   1. Gemini sends server_content.interrupted = True
   2. _receive_loop sees it IMMEDIATELY (not blocked on telephony send)
-  3. _audio_out_q is cleared (discards un-sent audio chunks)
+  3. _audio_out_q is cleared (discards un-sent PCM chunks)
   4. on_interrupt() sends "clear" to Twilio (discards already-sent buffer)
 
 VAD (Voice Activity Detection) configuration:
   - start_of_speech_sensitivity = HIGH → catches quiet telephony speech
   - end_of_speech_sensitivity   = LOW  → allows natural pauses
-  - prefix_padding_ms           = 200  → 200ms of speech before commit
-  - silence_duration_ms         = 500  → 500ms silence before end-of-speech
+  - prefix_padding_ms           = 150  → 150ms of speech before commit
+  - silence_duration_ms         = 300  → 300ms silence before end-of-speech
   - turn_coverage = ONLY_ACTIVITY      → strips silence from context
 
 SDK methods used (per Google docs — NO deprecated send()):
@@ -62,6 +84,7 @@ Audio formats:
   - Telephony  → g711_ulaw  @ 8 kHz
   - Gemini in  → PCM16      @ 16 kHz
   - Gemini out → PCM16      @ 24 kHz
+  - Queue      → PCM16      @ 8 kHz  (raw, for linear-space mixing)
 
 Reference:
   https://ai.google.dev/gemini-api/docs/live?example=mic-stream
@@ -74,6 +97,7 @@ import array as _arr
 import base64
 import json
 import logging
+import os
 import time
 import traceback
 import uuid
@@ -85,6 +109,7 @@ from google.genai import types
 from api.data.store import store
 from api.data.inventory import generate_car_url
 from api.providers.base import VoiceProvider
+from api.providers.soundscape import SoundscapeMixer
 from api.services.sse_manager import sse_manager
 from api.providers.prompts import prompt_6
 from api.services.analytics import analytics
@@ -196,19 +221,51 @@ def g711_ulaw_to_pcm16k(ulaw_b64: str) -> bytes:
     return out.tobytes()
 
 
-def pcm24k_to_g711_ulaw(pcm: bytes) -> str:
-    """PCM16 24 kHz → g711 μ-law 8 kHz  (downsample ×3, 3-sample average)."""
-    n = len(pcm) // 2
+def pcm24k_to_pcm8k(pcm24k: bytes) -> bytes:
+    """PCM16 24 kHz → PCM16 8 kHz  (downsample ×3, 3-sample average).
+
+    Returns raw PCM bytes — NO μ-law encoding.
+    This is the first half of the old pcm24k_to_g711_ulaw(), split out
+    so that soundscape mixing can happen in linear PCM space before
+    the final μ-law encoding step.
+    """
+    n = len(pcm24k) // 2
     if n < 3:
-        return ""
+        return b""
     samples = _arr.array("h")
-    samples.frombytes(pcm)
-    enc = _linear_to_ulaw
-    out = bytearray()
+    samples.frombytes(pcm24k)
+    out = _arr.array("h")
     for i in range(0, n - 2, 3):
         avg = (samples[i] + samples[i + 1] + samples[i + 2]) // 3
-        out.append(enc(avg))
+        out.append(avg)
+    return out.tobytes()
+
+
+def pcm8k_to_g711_ulaw(pcm8k: bytes) -> str:
+    """PCM16 8 kHz → g711 μ-law base64  (encode only, no resampling).
+
+    This is the second half of the pipeline — called AFTER all mixing
+    is done in linear PCM space.
+    """
+    n = len(pcm8k) // 2
+    if n == 0:
+        return ""
+    samples = _arr.array("h")
+    samples.frombytes(pcm8k)
+    enc = _linear_to_ulaw
+    out = bytearray()
+    for i in range(n):
+        out.append(enc(samples[i]))
     return base64.b64encode(bytes(out)).decode("ascii")
+
+
+def pcm24k_to_g711_ulaw(pcm: bytes) -> str:
+    """PCM16 24 kHz → g711 μ-law 8 kHz  (downsample + encode).
+
+    Convenience wrapper — combines pcm24k_to_pcm8k + pcm8k_to_g711_ulaw.
+    Kept for backward compatibility; the new pipeline calls them separately.
+    """
+    return pcm8k_to_g711_ulaw(pcm24k_to_pcm8k(pcm))
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -324,9 +381,10 @@ class GeminiVoiceProvider(VoiceProvider):
     Voice provider using the Google GenAI Live API.
 
     Three concurrent tasks run inside listen():
-      1. _send_audio_loop  — reads _audio_in_q  → send_realtime_input
-      2. _receive_loop     — session.receive()   → _audio_out_q / tool calls
-      3. _play_audio_loop  — reads _audio_out_q  → on_audio (telephony)
+      1. _send_audio_loop   — reads _audio_in_q  → send_realtime_input
+      2. _receive_loop      — session.receive()  → _audio_out_q / tool calls
+      3. _play_audio_loop   — reads _audio_out_q → on_audio (telephony)
+      4. _ambient_fill_loop — sends office hum when voice is idle
 
     This decoupled architecture guarantees:
       • The receive loop is NEVER blocked on telephony I/O.
@@ -394,6 +452,17 @@ class GeminiVoiceProvider(VoiceProvider):
         self._last_audio_sent_time: float = 0.0
         self._last_response_time: float = 0.0
         self._stale_warned: bool = False
+        # timestamp of last voice chunk played — ambient loop uses this
+        self._last_voice_play_ts: float = 0.0
+
+        # soundscape mixer (office ambience + keyboard clicks)
+        sounds_dir = os.path.join(
+            str(settings.BASE_DIR), "api", "providers", "sounds"
+        )
+        self._soundscape: Optional[SoundscapeMixer] = SoundscapeMixer.create(
+            office_path=os.path.join(sounds_dir, "office_sound.wav"),
+            keyboard_path=os.path.join(sounds_dir, "keyboard.wav"),
+        )
 
     # ── VoiceProvider interface ───────────────────────────────────────────
 
@@ -415,6 +484,9 @@ class GeminiVoiceProvider(VoiceProvider):
         self._running = False
         self._connected = False
         self._session = None
+        # Stop keyboard if still active
+        if self._soundscape:
+            self._soundscape.stop_keyboard()
         if self.call_id:
             CallLogger.log_event(self.call_id, "Disconnected from Gemini")
             analytics.end_call(self.call_id)
@@ -510,12 +582,12 @@ class GeminiVoiceProvider(VoiceProvider):
         #   → "end speech LESS often"
         #   → allows natural mid-sentence pauses without cutting off
         #
-        # prefix_padding_ms = 300
-        #   → 300 ms of speech must be detected before it's committed
+        # prefix_padding_ms = 150
+        #   → 150 ms of speech must be detected before it's committed
         #   → short noises (< 300 ms) are ignored entirely
         #
-        # silence_duration_ms = 700
-        #   → 700 ms of silence required before speech is considered ended
+        # silence_duration_ms = 300
+        #   → 300 ms of silence required before speech is considered ended
         #   → natural pauses (< 700 ms) don't trigger end-of-speech
         #
         # turn_coverage = TURN_INCLUDES_ONLY_ACTIVITY
@@ -533,8 +605,8 @@ class GeminiVoiceProvider(VoiceProvider):
                 end_of_speech_sensitivity=(
                     types.EndSensitivity.END_SENSITIVITY_LOW
                 ),
-                prefix_padding_ms=200,
-                silence_duration_ms=500,
+                prefix_padding_ms=150,
+                silence_duration_ms=300,
             ),
             turn_coverage=types.TurnCoverage.TURN_INCLUDES_ONLY_ACTIVITY,
         )
@@ -567,10 +639,11 @@ class GeminiVoiceProvider(VoiceProvider):
         )
 
         n_tools = len(tools[0].function_declarations)
+        snd = "ON" if self._soundscape else "OFF"
         print(
             f"[GEMINI] Connecting to {self.model} "
             f"(tools={n_tools}, VAD=HIGH/LOW/200/500, "
-            f"gain={TELEPHONY_GAIN}x, think=OFF)…"
+            f"gain={TELEPHONY_GAIN}x, think=OFF, soundscape={snd})…"
         )
 
         # --- session ---------------------------------------------------------
@@ -591,7 +664,7 @@ class GeminiVoiceProvider(VoiceProvider):
                 # send greeting via turn-based API (once, before realtime)
                 await self._send_greeting(session)
 
-                # run three concurrent loops
+                # run four concurrent loops
                 send_task = asyncio.ensure_future(
                     self._send_audio_loop(session)
                 )
@@ -604,14 +677,19 @@ class GeminiVoiceProvider(VoiceProvider):
                     self._play_audio_loop()
                 )
                 play_task._gemini_name = "play_audio_loop"
+                ambient_task = asyncio.ensure_future(
+                    self._ambient_fill_loop()
+                )
+                ambient_task._gemini_name = "ambient_fill_loop"
 
-                all_tasks = [send_task, recv_task, play_task]
+                all_tasks = [send_task, recv_task, play_task, ambient_task]
                 task_names = {
                     id(send_task): "send_audio_loop",
                     id(recv_task): "receive_loop",
                     id(play_task): "play_audio_loop",
+                    id(ambient_task): "ambient_fill_loop",
                 }
-                print("[GEMINI] All 3 tasks started")
+                print("[GEMINI] All 4 tasks started")
 
                 try:
                     done, pending = await asyncio.wait(
@@ -791,6 +869,8 @@ class GeminiVoiceProvider(VoiceProvider):
                     turn_count += 1
                     turn_audio_chunks = 0
                     turn_start_time = time.monotonic()
+                    first_transcript_time = 0.0  # for latency measurement
+                    first_audio_time = 0.0
                     print(
                         f"[GEMINI] [recv] Turn {turn_count} — "
                         f"waiting for responses…"
@@ -820,6 +900,10 @@ class GeminiVoiceProvider(VoiceProvider):
                                     )
                             ot = sc.output_transcription
                             if ot and ot.text:
+                                if first_transcript_time == 0.0:
+                                    first_transcript_time = (
+                                        time.monotonic()
+                                    )
                                 if self.call_id:
                                     CallLogger.log_assistant_speech(
                                         self.call_id, ot.text
@@ -836,6 +920,11 @@ class GeminiVoiceProvider(VoiceProvider):
                                     f"INTERRUPTED (audio in out_q="
                                     f"{self._audio_out_q.qsize()})"
                                 )
+                                # Stop keyboard if active
+                                if (self._soundscape
+                                        and self._soundscape
+                                        .keyboard_active):
+                                    self._soundscape.stop_keyboard()
                                 self._drain_output_queue()
                                 if self.on_interrupt:
                                     await self.on_interrupt()
@@ -854,22 +943,52 @@ class GeminiVoiceProvider(VoiceProvider):
                                             isinstance(idata.data, bytes)):
                                         self._chunks_recv += 1
                                         turn_audio_chunks += 1
-                                        if self._chunks_recv == 1:
-                                            elapsed = (
+                                        if turn_audio_chunks == 1:
+                                            first_audio_time = (
                                                 time.monotonic()
+                                            )
+                                            elapsed = (
+                                                first_audio_time
                                                 - turn_start_time
                                             )
+                                            # Measure text→audio gap
+                                            txt_gap = ""
+                                            if first_transcript_time > 0:
+                                                gap = (
+                                                    first_audio_time
+                                                    - first_transcript_time
+                                                ) * 1000
+                                                txt_gap = (
+                                                    f" (transcript→audio "
+                                                    f"gap: {gap:.0f}ms)"
+                                                )
                                             print(
                                                 f"[GEMINI] ◀ First audio "
                                                 f"({len(idata.data)}B) "
                                                 f"after {elapsed:.2f}s"
+                                                f"{txt_gap}"
                                             )
-                                        ulaw = pcm24k_to_g711_ulaw(
+
+                                        # Stop keyboard clicks as soon
+                                        # as Gemini starts speaking
+                                        if (self._soundscape
+                                                and self._soundscape
+                                                .keyboard_active):
+                                            self._soundscape.stop_keyboard()
+                                            print(
+                                                "[GEMINI] ⌨ Keyboard "
+                                                "stopped (voice resumed)"
+                                            )
+
+                                        # Downsample to 8kHz PCM (raw)
+                                        # Mixing + μ-law encoding happens
+                                        # in _play_audio_loop
+                                        pcm8k = pcm24k_to_pcm8k(
                                             idata.data
                                         )
-                                        if ulaw:
+                                        if pcm8k:
                                             self._audio_out_q.put_nowait(
-                                                ulaw
+                                                pcm8k
                                             )
 
                                     if part.text:
@@ -995,16 +1114,49 @@ class GeminiVoiceProvider(VoiceProvider):
     # ── TASK 3: play audio loop ───────────────────────────────────────────
 
     async def _play_audio_loop(self) -> None:
-        """Read from _audio_out_q → send to telephony via on_audio."""
+        """Read PCM8k from _audio_out_q → mix soundscape → encode → telephony.
+
+        This is the ONLY place where μ-law encoding happens for voice.
+        Soundscape mixing occurs in linear PCM16 space (mathematically
+        correct) before the non-linear μ-law compression step.
+
+        Voice path — ZERO added latency:
+          Pure `await queue.get()`.  Returns the instant a chunk is
+          available.  No timeouts, no task wrapping, no overhead.
+          Updates `_last_voice_play_ts` so the ambient loop knows
+          when to stay quiet.
+        """
         print("[GEMINI] [play_audio_loop] Started")
         played = 0
         try:
             while self._running:
                 try:
-                    ulaw = await self._audio_out_q.get()
-                    if self.on_audio:
+                    pcm8k = await self._audio_out_q.get()
+
+                    now = time.monotonic()
+                    # Timestamp for ambient grace period
+                    self._last_voice_play_ts = now
+
+                    # Mix soundscape in LINEAR PCM space
+                    if self._soundscape:
+                        pcm8k = self._soundscape.mix(pcm8k)
+
+                    # Encode to μ-law (LAST step — after all mixing)
+                    ulaw = pcm8k_to_g711_ulaw(pcm8k)
+                    if ulaw and self.on_audio:
                         await self.on_audio(ulaw)
                     played += 1
+
+                    # Log pipeline overhead for first chunk
+                    if played == 1:
+                        pipe_ms = (
+                            time.monotonic() - now
+                        ) * 1000
+                        print(
+                            f"[GEMINI] [play] First chunk "
+                            f"pipeline: {pipe_ms:.1f}ms "
+                            f"(mix+encode+send)"
+                        )
                 except asyncio.CancelledError:
                     raise
                 except Exception as e:
@@ -1020,9 +1172,54 @@ class GeminiVoiceProvider(VoiceProvider):
                     break
         except asyncio.CancelledError:
             pass
+        print(f"[GEMINI] [play_audio_loop] Stopped (played {played})")
+
+    # ── TASK 4: ambient fill loop ────────────────────────────────────────
+
+    async def _ambient_fill_loop(self) -> None:
+        """Send continuous office ambience when voice is NOT playing.
+
+        Runs independently at 20ms intervals (telephony frame rate).
+        Uses a grace period after the last voice chunk to prevent
+        ambient frames from being injected mid-speech:
+
+          - During voice playback (chunks every ~20ms), grace period
+            keeps this loop silent — zero interference with voice.
+          - 60ms after the last voice chunk, ambient kicks in.
+            The 60ms gap is imperceptible to humans.
+          - During tool calls, keyboard_active makes idle frames
+            include click sounds automatically.
+
+        This ensures the caller always hears the office environment,
+        even while speaking or during silence gaps.
+        """
+        IDLE_SAMPLES = 160      # 20ms of 8kHz = 160 samples
+        GRACE_SEC = 0.06        # 60ms — absorbs inter-chunk jitter
+        TICK = 0.02             # 20ms — matches telephony frame rate
+
+        idle_sent = 0
+        try:
+            while self._running:
+                await asyncio.sleep(TICK)
+
+                if not self._soundscape:
+                    continue
+
+                # Don't send ambient too close to voice — avoids glitches
+                elapsed = time.monotonic() - self._last_voice_play_ts
+                if elapsed < GRACE_SEC:
+                    continue
+
+                pcm8k = self._soundscape.get_idle_chunk(IDLE_SAMPLES)
+                ulaw = pcm8k_to_g711_ulaw(pcm8k)
+                if ulaw and self.on_audio:
+                    await self.on_audio(ulaw)
+                idle_sent += 1
+        except asyncio.CancelledError:
+            pass
         print(
-            f"[GEMINI] [play_audio_loop] Stopped "
-            f"(played {played} chunks)"
+            f"[GEMINI] [ambient_fill_loop] Stopped "
+            f"(sent {idle_sent} frames)"
         )
 
     # ── queue helpers ─────────────────────────────────────────────────────
@@ -1059,6 +1256,13 @@ class GeminiVoiceProvider(VoiceProvider):
                 CallLogger.log_event(
                     self.call_id, f"Tool: {name}", json.dumps(args)
                 )
+
+            # Start keyboard clicks for audible "typing" feedback.
+            # The _ambient_fill_loop generates idle frames continuously;
+            # when keyboard is active, those frames include click sounds.
+            if self._soundscape:
+                self._soundscape.start_keyboard()
+                print("[GEMINI] ⌨ Keyboard started (tool executing)")
 
             # execute
             t0 = time.monotonic()

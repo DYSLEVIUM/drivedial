@@ -115,7 +115,7 @@ class BaseMediaStreamConsumer(AsyncWebsocketConsumer):
             self._log_token_analysis_final()
             
             CallLogger.close_logger(self.call_id)
-    
+            
     def _log_token_analysis_final(self) -> None:
         """Finalize token tracking and log the comprehensive analysis."""
         if not self.call_id:

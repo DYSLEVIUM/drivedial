@@ -43,7 +43,7 @@ class Command(BaseCommand):
         self.stdout.write("Starting ngrok tunnel...")
         tunnel = ngrok.connect(port, "http")
         url = tunnel.public_url
-        
+
         # Convert http to wss for WebSocket URL
         ws_url = url.replace("https://", "wss://").replace("http://", "ws://")
 
