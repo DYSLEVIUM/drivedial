@@ -8,6 +8,7 @@ configuration settings.
 Supported Telephony Providers:
 - twilio: Twilio Media Streams
 - ozonetel: Ozonetel Bi-Directional Stream
+- vobiz: VoBiz Bi-Directional Stream
 
 Supported Voice Providers:
 - openai: OpenAI Realtime API
@@ -49,6 +50,10 @@ def _register_builtin_providers():
         from api.providers.ozonetel import OzonetelProvider
         register_telephony_provider("ozonetel", OzonetelProvider)
     
+    if "vobiz" not in _telephony_providers:
+        from api.providers.vobiz import VoBizProvider
+        register_telephony_provider("vobiz", VoBizProvider)
+    
     if "openai" not in _voice_providers:
         from api.providers.openai import OpenAIVoiceProvider
         register_voice_provider("openai", OpenAIVoiceProvider)
@@ -63,7 +68,7 @@ class ProviderFactory:
     Factory class for creating provider instances.
     
     Provider selection is driven by Django settings:
-    - TELEPHONY_PROVIDER: 'twilio' or 'ozonetel'
+    - TELEPHONY_PROVIDER: 'twilio', 'ozonetel', or 'vobiz'
     - VOICE_PROVIDER: 'openai'
     
     Usage:

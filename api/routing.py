@@ -11,6 +11,7 @@ from api.consumers import (
     MediaStreamConsumer,
     TwilioMediaStreamConsumer,
     OzonetelMediaStreamConsumer,
+    VoBizMediaStreamConsumer,
 )
 
 websocket_urlpatterns = [
@@ -20,4 +21,5 @@ websocket_urlpatterns = [
     # Provider-specific routes
     re_path(r"ws/twilio-stream/$", TwilioMediaStreamConsumer.as_asgi()),
     re_path(r"ws/ozonetel-stream/$", OzonetelMediaStreamConsumer.as_asgi()),
+    re_path(r"ws/vobiz-stream/$", VoBizMediaStreamConsumer.as_asgi()),
 ]

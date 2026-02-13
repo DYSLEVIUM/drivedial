@@ -117,8 +117,8 @@ REST_FRAMEWORK = {
 }
 
 # Provider Configuration
-# VOICE_PROVIDER: 'openai' (default)
-# TELEPHONY_PROVIDER: 'twilio' (default), 'ozonetel'
+# VOICE_PROVIDER: 'openai' (default), 'gemini'
+# TELEPHONY_PROVIDER: 'twilio' (default), 'ozonetel', 'vobiz'
 VOICE_PROVIDER = os.getenv("VOICE_PROVIDER", "openai")
 TELEPHONY_PROVIDER = os.getenv("TELEPHONY_PROVIDER", "twilio")
 
@@ -128,14 +128,21 @@ TELEPHONY_PROVIDER = os.getenv("TELEPHONY_PROVIDER", "twilio")
 TELEPHONY_ROUTE_MAPPING = {
     "twilio": "twilio",
     "ozonetel": "ozonetel",
+    "vobiz": "vobiz",
     "media-stream": os.getenv("TELEPHONY_PROVIDER", "twilio"),  # Default route
     "twilio-stream": "twilio",
     "ozonetel-stream": "ozonetel",
+    "vobiz-stream": "vobiz",
 }
 
 # Ozonetel Configuration
 OZONETEL_API_KEY = os.getenv("OZONETEL_API_KEY", "")
 OZONETEL_SIP_NUMBER = os.getenv("OZONETEL_SIP_NUMBER", "")
+
+# VoBiz Configuration
+VOBIZ_AUTH_ID = os.getenv("VOBIZ_AUTH_ID", "")
+VOBIZ_AUTH_TOKEN = os.getenv("VOBIZ_AUTH_TOKEN", "")
+VOBIZ_FROM_NUMBER = os.getenv("VOBIZ_FROM_NUMBER", "")
 
 # Gemini Configuration (Google)
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")

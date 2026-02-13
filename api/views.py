@@ -3,6 +3,7 @@ import json
 import logging
 from datetime import date
 
+import requests as http_requests
 from django.conf import settings
 from django.http import HttpResponse, StreamingHttpResponse
 from django.utils.decorators import method_decorator
@@ -621,3 +622,171 @@ class OzonetelDebugView(APIView):
                 "X-Forwarded-Proto": request.META.get('HTTP_X_FORWARDED_PROTO', ''),
             }
         })
+
+
+# =============================================================================
+# VoBiz Telephony
+# =============================================================================
+
+class VoBizIncomingCallView(APIView):
+    """
+    Webhook endpoint that VoBiz calls when an outbound call is answered.
+
+    VoBiz sends a POST/GET to the answer_url configured in the outbound call
+    request. We respond with XML that initiates a bidirectional WebSocket
+    stream (identical pattern to Twilio / Ozonetel incoming-call endpoints).
+    """
+    authentication_classes = []
+    permission_classes = []
+
+    def _handle(self, request: Request) -> HttpResponse:
+        host = request.META.get("HTTP_X_FORWARDED_HOST") or request.get_host()
+        forwarded_proto = request.META.get("HTTP_X_FORWARDED_PROTO", "")
+        is_secure = forwarded_proto == "https" or request.is_secure()
+        ws_protocol = "wss" if is_secure else "ws"
+
+        # VoBiz may pass these as query-params or POST body
+        params = request.query_params if request.method == "GET" else request.data
+        call_uuid = params.get("CallUUID", params.get("callUUID", "unknown"))
+        from_number = params.get("From", params.get("from", "unknown"))
+        to_number = params.get("To", params.get("to", "unknown"))
+
+        logger.info(
+            f"VoBiz webhook: callUUID={call_uuid}, from={from_number}, "
+            f"to={to_number}, host={host}, proto={ws_protocol}"
+        )
+
+        telephony = ProviderFactory.get_telephony("vobiz")
+        response_xml = telephony.generate_stream_response(
+            host,
+            "ws/vobiz-stream/",
+            protocol=ws_protocol,
+            from_number=from_number,
+            to_number=to_number,
+            call_id=call_uuid,
+        )
+        logger.info(f"VoBiz response XML: {response_xml}")
+        return HttpResponse(response_xml, content_type="application/xml")
+
+    def get(self, request: Request) -> HttpResponse:
+        return self._handle(request)
+
+    def post(self, request: Request) -> HttpResponse:
+        return self._handle(request)
+
+
+class OutboundCallView(APIView):
+    """
+    Provider-agnostic outbound call API.
+
+    Reads TELEPHONY_PROVIDER (or accepts ?provider= override) to decide
+    which telephony platform to use for placing the call.
+
+    Currently supported: vobiz.
+
+    POST /api/outbound-call/
+    Body:
+      {
+        "to":       "+917541918820",        # required
+        "from":     "+918071387318",        # optional – falls back to env
+        "provider": "vobiz"                 # optional – falls back to TELEPHONY_PROVIDER
+      }
+    """
+    authentication_classes = []
+    permission_classes = []
+
+    def post(self, request: Request) -> Response:
+        to_number = request.data.get("to")
+        if not to_number:
+            return Response({"error": "Missing required field: to"}, status=400)
+
+        provider_name = (
+            request.data.get("provider")
+            or request.query_params.get("provider")
+            or getattr(settings, "TELEPHONY_PROVIDER", "twilio")
+        ).lower()
+
+        # ── VoBiz outbound ────────────────────────────────────────────
+        if provider_name == "vobiz":
+            return self._vobiz_outbound(request, to_number)
+
+        # ── Unsupported provider ──────────────────────────────────────
+        return Response(
+            {"error": f"Outbound calls not supported for provider: {provider_name}"},
+            status=400,
+        )
+
+    # -----------------------------------------------------------------
+    # VoBiz
+    # -----------------------------------------------------------------
+    def _vobiz_outbound(self, request: Request, to_number: str) -> Response:
+        auth_id = getattr(settings, "VOBIZ_AUTH_ID", "")
+        auth_token = getattr(settings, "VOBIZ_AUTH_TOKEN", "")
+        from_number = (
+            request.data.get("from")
+            or getattr(settings, "VOBIZ_FROM_NUMBER", "")
+        )
+
+        if not auth_id or not auth_token:
+            return Response(
+                {"error": "VOBIZ_AUTH_ID and VOBIZ_AUTH_TOKEN must be set in env"},
+                status=500,
+            )
+        if not from_number:
+            return Response(
+                {"error": "Missing 'from' number. Set VOBIZ_FROM_NUMBER in env or pass in body"},
+                status=400,
+            )
+
+        # Build the answer_url pointing back to our VoBiz webhook
+        host = request.META.get("HTTP_X_FORWARDED_HOST") or request.get_host()
+        forwarded_proto = request.META.get("HTTP_X_FORWARDED_PROTO", "")
+        is_secure = forwarded_proto == "https" or request.is_secure()
+        http_protocol = "https" if is_secure else "http"
+        answer_url = f"{http_protocol}://{host}/webhooks/vobiz/"
+
+        # Allow caller to override answer_url (e.g. with a cloudflare tunnel)
+        answer_url = request.data.get("answer_url", answer_url)
+
+        api_url = f"https://api.vobiz.ai/api/v1/Account/{auth_id}/Call/"
+        payload = {
+            "from": from_number,
+            "to": to_number,
+            "answer_url": answer_url,
+        }
+        headers = {
+            "X-Auth-ID": auth_id,
+            "X-Auth-Token": auth_token,
+            "Content-Type": "application/json",
+        }
+
+        logger.info(
+            f"VoBiz outbound call: from={from_number} to={to_number} "
+            f"answer_url={answer_url}"
+        )
+
+        try:
+            resp = http_requests.post(api_url, json=payload, headers=headers, timeout=15)
+            resp_data = resp.json() if resp.headers.get("content-type", "").startswith("application/json") else {"raw": resp.text}
+            logger.info(f"VoBiz API response ({resp.status_code}): {resp_data}")
+
+            if resp.status_code >= 400:
+                return Response(
+                    {"error": "VoBiz API error", "status": resp.status_code, "detail": resp_data},
+                    status=502,
+                )
+
+            return Response({
+                "status": "initiated",
+                "provider": "vobiz",
+                "to": to_number,
+                "from": from_number,
+                "answer_url": answer_url,
+                "vobiz_response": resp_data,
+            })
+        except http_requests.RequestException as exc:
+            logger.error(f"VoBiz outbound call failed: {exc}")
+            return Response(
+                {"error": f"Failed to reach VoBiz API: {exc}"},
+                status=502,
+            )

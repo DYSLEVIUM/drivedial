@@ -12,6 +12,7 @@ from api.views import (
     UsageView, 
     OzonetelIncomingCallView,
     OzonetelDebugView,
+    OutboundCallView,
 )
 
 app_name = "api"
@@ -24,6 +25,9 @@ urlpatterns = [
     path("incoming-call/", IncomingCallView.as_view(), name="incoming-call"),
     path("ozonetel-start/", OzonetelIncomingCallView.as_view(), name="ozonetel-start"),
     path("ozonetel-debug/", OzonetelDebugView.as_view(), name="ozonetel-debug"),
+    
+    # Outbound calls (provider-agnostic)
+    path("outbound-call/", OutboundCallView.as_view(), name="outbound-call"),
     
     # Call analytics
     path("analytics/<str:call_id>/", CallAnalyticsView.as_view(), name="call-analytics"),

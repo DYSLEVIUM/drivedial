@@ -93,7 +93,7 @@ Reference:
 """
 
 import asyncio
-import array as _arr
+import audioop
 import base64
 import json
 import logging
@@ -127,64 +127,19 @@ for _name in ("websockets", "websockets.client",
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # Audio Conversion  (g711 μ-law 8 kHz ⇄ PCM16 16/24 kHz)
+#
+# All conversions use Python's built-in `audioop` module (C-optimized,
+# ITU-T G.711 compliant).  This replaces the previous hand-rolled per-sample
+# Python loops that were:
+#   • Slow — ~24,000 Python iterations per second of audio
+#   • Fragile — subtle encoding errors causing distortion
+#   • Stateless — clicks at chunk boundaries due to no ratecv state
+#
+# `audioop.ratecv` maintains internal filter state between calls,
+# eliminating inter-chunk discontinuities when the same state object
+# is reused.  The GeminiVoiceProvider stores these states as instance
+# variables (_upsample_state, _downsample_state).
 # ═══════════════════════════════════════════════════════════════════════════════
-
-ULAW_TO_LINEAR = [
-    -32124, -31100, -30076, -29052, -28028, -27004, -25980, -24956,
-    -23932, -22908, -21884, -20860, -19836, -18812, -17788, -16764,
-    -15996, -15484, -14972, -14460, -13948, -13436, -12924, -12412,
-    -11900, -11388, -10876, -10364,  -9852,  -9340,  -8828,  -8316,
-     -7932,  -7676,  -7420,  -7164,  -6908,  -6652,  -6396,  -6140,
-     -5884,  -5628,  -5372,  -5116,  -4860,  -4604,  -4348,  -4092,
-     -3900,  -3772,  -3644,  -3516,  -3388,  -3260,  -3132,  -3004,
-     -2876,  -2748,  -2620,  -2492,  -2364,  -2236,  -2108,  -1980,
-     -1884,  -1820,  -1756,  -1692,  -1628,  -1564,  -1500,  -1436,
-     -1372,  -1308,  -1244,  -1180,  -1116,  -1052,   -988,   -924,
-      -876,   -844,   -812,   -780,   -748,   -716,   -684,   -652,
-      -620,   -588,   -556,   -524,   -492,   -460,   -428,   -396,
-      -372,   -356,   -340,   -324,   -308,   -292,   -276,   -260,
-      -244,   -228,   -212,   -196,   -180,   -164,   -148,   -132,
-      -120,   -112,   -104,    -96,    -88,    -80,    -72,    -64,
-       -56,    -48,    -40,    -32,    -24,    -16,     -8,      0,
-     32124,  31100,  30076,  29052,  28028,  27004,  25980,  24956,
-     23932,  22908,  21884,  20860,  19836,  18812,  17788,  16764,
-     15996,  15484,  14972,  14460,  13948,  13436,  12924,  12412,
-     11900,  11388,  10876,  10364,   9852,   9340,   8828,   8316,
-      7932,   7676,   7420,   7164,   6908,   6652,   6396,   6140,
-      5884,   5628,   5372,   5116,   4860,   4604,   4348,   4092,
-      3900,   3772,   3644,   3516,   3388,   3260,   3132,   3004,
-      2876,   2748,   2620,   2492,   2364,   2236,   2108,   1980,
-      1884,   1820,   1756,   1692,   1628,   1564,   1500,   1436,
-      1372,   1308,   1244,   1180,   1116,   1052,    988,    924,
-       876,    844,    812,    780,    748,    716,    684,    652,
-       620,    588,    556,    524,    492,    460,    428,    396,
-       372,    356,    340,    324,    308,    292,    276,    260,
-       244,    228,    212,    196,    180,    164,    148,    132,
-       120,    112,    104,     96,     88,     80,     72,     64,
-        56,     48,     40,     32,     24,     16,      8,      0,
-]
-
-_ULAW_BIAS = 0x84
-_ULAW_CLIP = 32635
-
-
-def _linear_to_ulaw(sample: int) -> int:
-    sign = (sample >> 8) & 0x80
-    if sign:
-        sample = -sample
-    if sample > _ULAW_CLIP:
-        sample = _ULAW_CLIP
-    sample += _ULAW_BIAS
-    exponent = 7
-    mask = 0x4000
-    for _ in range(8):
-        if sample & mask:
-            break
-        exponent -= 1
-        mask >>= 1
-    mantissa = (sample >> (exponent + 3)) & 0x0F
-    return (~(sign | (exponent << 4) | mantissa)) & 0xFF
-
 
 # Gain factor for telephony → Gemini.
 # μ-law decoded speech is typically ±1000-5000; Gemini VAD expects
@@ -192,80 +147,73 @@ def _linear_to_ulaw(sample: int) -> int:
 TELEPHONY_GAIN = 4
 
 
-def _clamp16(v: int) -> int:
-    """Clamp to signed 16-bit range."""
-    if v > 32767:
-        return 32767
-    if v < -32768:
-        return -32768
-    return v
+def g711_ulaw_to_pcm16k(ulaw_b64: str, upsample_state=None):
+    """g711 μ-law 8 kHz → PCM16 16 kHz  (decode + gain + upsample).
 
+    Args:
+        ulaw_b64:       Base64-encoded μ-law audio
+        upsample_state: ratecv state from the previous call (or None for first)
 
-def g711_ulaw_to_pcm16k(ulaw_b64: str) -> bytes:
-    """g711 μ-law 8 kHz → PCM16 16 kHz  (upsample ×2, linear interp, +gain)."""
+    Returns:
+        (pcm16k_bytes, new_upsample_state)
+    """
     raw = base64.b64decode(ulaw_b64)
-    n = len(raw)
-    if n == 0:
-        return b""
-    tbl = ULAW_TO_LINEAR
-    gain = TELEPHONY_GAIN
-    clamp = _clamp16
-    out = _arr.array("h")
-    prev = tbl[raw[0]] * gain
-    out.append(clamp(prev))
-    for i in range(1, n):
-        cur = tbl[raw[i]] * gain
-        out.append(clamp((prev + cur) >> 1))
-        out.append(clamp(cur))
-        prev = cur
-    return out.tobytes()
+    if not raw:
+        return b"", upsample_state
+
+    # μ-law → linear PCM16 at 8 kHz  (C-optimized, ITU-T G.711 exact)
+    pcm8k = audioop.ulaw2lin(raw, 2)
+
+    # Apply telephony gain  (audioop.mul is C-level, no Python loop)
+    pcm8k = audioop.mul(pcm8k, 2, TELEPHONY_GAIN)
+
+    # Upsample 8 kHz → 16 kHz  (with filter state for smooth boundaries)
+    pcm16k, new_state = audioop.ratecv(pcm8k, 2, 1, 8000, 16000, upsample_state)
+    return pcm16k, new_state
 
 
-def pcm24k_to_pcm8k(pcm24k: bytes) -> bytes:
-    """PCM16 24 kHz → PCM16 8 kHz  (downsample ×3, 3-sample average).
+def pcm24k_to_pcm8k(pcm24k: bytes, downsample_state=None):
+    """PCM16 24 kHz → PCM16 8 kHz  (downsample ×3, C-optimized).
 
     Returns raw PCM bytes — NO μ-law encoding.
-    This is the first half of the old pcm24k_to_g711_ulaw(), split out
-    so that soundscape mixing can happen in linear PCM space before
-    the final μ-law encoding step.
+    Soundscape mixing happens in linear PCM space before encoding.
+
+    Args:
+        pcm24k:           Raw PCM16 bytes at 24 kHz
+        downsample_state: ratecv state from the previous call (or None)
+
+    Returns:
+        (pcm8k_bytes, new_downsample_state)
     """
-    n = len(pcm24k) // 2
-    if n < 3:
-        return b""
-    samples = _arr.array("h")
-    samples.frombytes(pcm24k)
-    out = _arr.array("h")
-    for i in range(0, n - 2, 3):
-        avg = (samples[i] + samples[i + 1] + samples[i + 2]) // 3
-        out.append(avg)
-    return out.tobytes()
+    if len(pcm24k) < 6:  # need at least 3 samples (6 bytes)
+        return b"", downsample_state
+
+    pcm8k, new_state = audioop.ratecv(pcm24k, 2, 1, 24000, 8000, downsample_state)
+    return pcm8k, new_state
 
 
 def pcm8k_to_g711_ulaw(pcm8k: bytes) -> str:
     """PCM16 8 kHz → g711 μ-law base64  (encode only, no resampling).
 
-    This is the second half of the pipeline — called AFTER all mixing
-    is done in linear PCM space.
+    Called AFTER all linear-space mixing (voice + soundscape).
+    Uses audioop.lin2ulaw — C-optimized, ITU-T G.711 exact.
     """
-    n = len(pcm8k) // 2
-    if n == 0:
+    if not pcm8k:
         return ""
-    samples = _arr.array("h")
-    samples.frombytes(pcm8k)
-    enc = _linear_to_ulaw
-    out = bytearray()
-    for i in range(n):
-        out.append(enc(samples[i]))
-    return base64.b64encode(bytes(out)).decode("ascii")
+    ulaw = audioop.lin2ulaw(pcm8k, 2)
+    return base64.b64encode(ulaw).decode("ascii")
 
 
-def pcm24k_to_g711_ulaw(pcm: bytes) -> str:
+def pcm24k_to_g711_ulaw(pcm24k: bytes, downsample_state=None):
     """PCM16 24 kHz → g711 μ-law 8 kHz  (downsample + encode).
 
     Convenience wrapper — combines pcm24k_to_pcm8k + pcm8k_to_g711_ulaw.
-    Kept for backward compatibility; the new pipeline calls them separately.
+
+    Returns:
+        (ulaw_b64_str, new_downsample_state)
     """
-    return pcm8k_to_g711_ulaw(pcm24k_to_pcm8k(pcm))
+    pcm8k, new_state = pcm24k_to_pcm8k(pcm24k, downsample_state)
+    return pcm8k_to_g711_ulaw(pcm8k), new_state
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -455,6 +403,17 @@ class GeminiVoiceProvider(VoiceProvider):
         # timestamp of last voice chunk played — ambient loop uses this
         self._last_voice_play_ts: float = 0.0
 
+        # audioop.ratecv filter state — maintains continuity between
+        # audio chunks to eliminate inter-chunk clicks/pops.
+        self._upsample_state = None     # 8 kHz → 16 kHz  (send path)
+        self._downsample_state = None   # 24 kHz → 8 kHz  (receive path)
+
+        # transcript accumulation buffers
+        # Gemini streams transcriptions word-by-word; we accumulate
+        # fragments and flush complete utterances to CallLogger.
+        self._user_transcript_buf: str = ""
+        self._assistant_transcript_buf: str = ""
+
         # soundscape mixer (office ambience + keyboard clicks)
         sounds_dir = os.path.join(
             str(settings.BASE_DIR), "api", "providers", "sounds"
@@ -487,6 +446,8 @@ class GeminiVoiceProvider(VoiceProvider):
         # Stop keyboard if still active
         if self._soundscape:
             self._soundscape.stop_keyboard()
+        # Flush any remaining transcript fragments
+        self._flush_all_transcripts()
         if self.call_id:
             CallLogger.log_event(self.call_id, "Disconnected from Gemini")
             analytics.end_call(self.call_id)
@@ -496,12 +457,35 @@ class GeminiVoiceProvider(VoiceProvider):
             f"(sent={self._chunks_sent} recv={self._chunks_recv})"
         )
 
+    # ── transcript accumulation ──────────────────────────────────────────
+
+    def _flush_user_transcript(self) -> None:
+        """Flush accumulated user transcript fragments as one log entry."""
+        text = self._user_transcript_buf.strip()
+        if text and self.call_id:
+            CallLogger.log_user_speech(self.call_id, text)
+        self._user_transcript_buf = ""
+
+    def _flush_assistant_transcript(self) -> None:
+        """Flush accumulated assistant transcript fragments as one log entry."""
+        text = self._assistant_transcript_buf.strip()
+        if text and self.call_id:
+            CallLogger.log_assistant_speech(self.call_id, text)
+        self._assistant_transcript_buf = ""
+
+    def _flush_all_transcripts(self) -> None:
+        """Flush both transcript buffers (e.g. on turn complete / disconnect)."""
+        self._flush_user_transcript()
+        self._flush_assistant_transcript()
+
     async def send_audio(self, payload: str) -> None:
         """Accept g711_ulaw base64 from telephony and queue for Gemini."""
         if not self._running or not self._session:
             return
         try:
-            pcm = g711_ulaw_to_pcm16k(payload)
+            pcm, self._upsample_state = g711_ulaw_to_pcm16k(
+                payload, self._upsample_state
+            )
 
             # ── diagnostic: audio level monitoring ─────────────────
             # Log on first chunk and every 250 chunks (~5 seconds)
@@ -511,12 +495,10 @@ class GeminiVoiceProvider(VoiceProvider):
                     and self._chunks_sent % 250 == 0)
             )
             if should_log and len(pcm) >= 4:
-                samples = _arr.array("h")
-                samples.frombytes(pcm)
-                n = len(samples)
-                mn = min(samples)
-                mx = max(samples)
-                rms = int((sum(s * s for s in samples) / n) ** 0.5)
+                rms = audioop.rms(pcm, 2)
+                mn = audioop.minmax(pcm, 2)[0]
+                mx = audioop.minmax(pcm, 2)[1]
+                n = len(pcm) // 2
                 label = (
                     "First" if self._chunks_sent == 0
                     else f"#{self._chunks_sent}"
@@ -888,33 +870,31 @@ class GeminiVoiceProvider(VoiceProvider):
                         if sc is not None:
 
                             # ── transcriptions (user & assistant) ──────
+                            # Gemini streams transcriptions word-by-word.
+                            # We accumulate fragments and flush complete
+                            # utterances on speaker change / turn end.
                             it = sc.input_transcription
                             if it and it.text:
-                                if self.call_id:
-                                    CallLogger.log_user_speech(
-                                        self.call_id, it.text
-                                    )
-                                if self.on_transcript:
-                                    await self.on_transcript(
-                                        it.text, True  # is_user=True
-                                    )
+                                # Speaker changed to user → flush assistant
+                                if self._assistant_transcript_buf:
+                                    self._flush_assistant_transcript()
+                                self._user_transcript_buf += it.text
+
                             ot = sc.output_transcription
                             if ot and ot.text:
                                 if first_transcript_time == 0.0:
                                     first_transcript_time = (
                                         time.monotonic()
                                     )
-                                if self.call_id:
-                                    CallLogger.log_assistant_speech(
-                                        self.call_id, ot.text
-                                    )
-                                if self.on_transcript:
-                                    await self.on_transcript(
-                                        ot.text, False  # is_user=False
-                                    )
+                                # Speaker changed to assistant → flush user
+                                if self._user_transcript_buf:
+                                    self._flush_user_transcript()
+                                self._assistant_transcript_buf += ot.text
 
                             # INTERRUPTION
                             if sc.interrupted:
+                                # Flush partial transcripts before clearing
+                                self._flush_all_transcripts()
                                 print(
                                     f"[GEMINI] [recv] Turn {turn_count}: "
                                     f"INTERRUPTED (audio in out_q="
@@ -983,8 +963,11 @@ class GeminiVoiceProvider(VoiceProvider):
                                         # Downsample to 8kHz PCM (raw)
                                         # Mixing + μ-law encoding happens
                                         # in _play_audio_loop
-                                        pcm8k = pcm24k_to_pcm8k(
-                                            idata.data
+                                        pcm8k, self._downsample_state = (
+                                            pcm24k_to_pcm8k(
+                                                idata.data,
+                                                self._downsample_state,
+                                            )
                                         )
                                         if pcm8k:
                                             self._audio_out_q.put_nowait(
@@ -996,14 +979,12 @@ class GeminiVoiceProvider(VoiceProvider):
                                             f"[GEMINI] [recv] Text: "
                                             f"{part.text[:80]!r}"
                                         )
-                                        if self.call_id:
-                                            CallLogger.log_assistant_speech(
-                                                self.call_id, part.text
-                                            )
-                                        if self.on_transcript:
-                                            await self.on_transcript(
-                                                part.text, False
-                                            )
+                                        # Buffer text (same as output_transcription)
+                                        if self._user_transcript_buf:
+                                            self._flush_user_transcript()
+                                        self._assistant_transcript_buf += (
+                                            part.text
+                                        )
                             else:
                                 # server_content with no model_turn
                                 # and not interrupted — inspect fields
@@ -1066,6 +1047,9 @@ class GeminiVoiceProvider(VoiceProvider):
                             )
 
                     # ── turn complete ───────────────────────────────────
+                    # Flush any remaining transcript fragments
+                    self._flush_all_transcripts()
+
                     elapsed = time.monotonic() - turn_start_time
                     print(
                         f"[GEMINI] Turn {turn_count} complete — "
