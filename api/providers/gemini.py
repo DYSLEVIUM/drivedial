@@ -98,10 +98,12 @@ import base64
 import json
 import logging
 import os
+import statistics
 import time
 import traceback
 import uuid
-from typing import Any, Callable, Optional
+from dataclasses import dataclass, field
+from typing import Any, Callable, Dict, List, Optional
 
 from google import genai
 from google.genai import types
@@ -214,6 +216,307 @@ def pcm24k_to_g711_ulaw(pcm24k: bytes, downsample_state=None):
     """
     pcm8k, new_state = pcm24k_to_pcm8k(pcm24k, downsample_state)
     return pcm8k_to_g711_ulaw(pcm8k), new_state
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Latency Metrics — Granular per-turn and per-call tracking
+#
+# Every stage of the audio pipeline is timestamped:
+#
+#   INPUT PATH (user → model):
+#     t_user_speech_end    — VAD fires end-of-speech (silence_duration_ms expires)
+#     t_send_audio_in      — chunk enters _audio_in_q
+#     t_send_audio_out     — chunk sent to Gemini via send_realtime_input
+#
+#   MODEL PROCESSING:
+#     t_turn_start         — session.receive() yields the first response
+#     t_first_transcript   — first output_transcription text arrives
+#     t_first_audio        — first inline_data audio chunk arrives
+#
+#   OUTPUT PATH (model → telephony):
+#     t_audio_queued       — pcm8k placed in _audio_out_q
+#     t_play_dequeued      — _play_audio_loop picks up the chunk
+#     t_play_mixed         — after soundscape mix
+#     t_play_encoded       — after μ-law encoding
+#     t_play_sent          — after on_audio() callback completes
+#
+#   TOOL CALLS:
+#     t_tool_received      — tool_call arrives from Gemini
+#     t_tool_exec_start    — _execute_tool() starts
+#     t_tool_exec_end      — _execute_tool() finishes
+#     t_tool_response_sent — send_tool_response() completes
+#     t_tool_first_audio   — first audio after tool response
+#
+# Derived metrics (per-turn):
+#   vad_to_first_audio     = t_first_audio - t_user_speech_end
+#   model_thinking_time    = t_first_audio - t_turn_start
+#   transcript_audio_gap   = t_first_audio - t_first_transcript
+#   play_pipeline_ms       = t_play_sent  - t_play_dequeued
+#   e2e_first_byte         = t_play_sent  - t_user_speech_end
+#   tool_exec_ms           = t_tool_exec_end - t_tool_exec_start
+#   tool_round_trip_ms     = t_tool_first_audio - t_tool_received
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+@dataclass
+class TurnMetrics:
+    """Latency measurements for a single conversational turn."""
+    turn_number: int = 0
+
+    # Core timestamps (monotonic)
+    t_turn_start: float = 0.0
+    t_first_transcript: float = 0.0
+    t_first_audio: float = 0.0
+    t_first_audio_queued: float = 0.0
+    t_first_play_dequeued: float = 0.0
+    t_first_play_sent: float = 0.0
+    t_turn_end: float = 0.0
+
+    # Audio chunk counts
+    audio_chunks_received: int = 0
+    audio_chunks_played: int = 0
+
+    # Queue depths at key moments
+    out_q_at_first_audio: int = 0
+
+    # Tool call metrics (if any)
+    tool_calls: List[Dict[str, float]] = field(default_factory=list)
+
+    # Play pipeline samples (mix+encode+send per chunk, sampled)
+    play_pipeline_samples_ms: List[float] = field(default_factory=list)
+
+    def summary(self) -> str:
+        """One-line summary of this turn's latencies."""
+        parts = [f"Turn {self.turn_number}"]
+
+        if self.t_first_audio > 0 and self.t_turn_start > 0:
+            model_ms = (self.t_first_audio - self.t_turn_start) * 1000
+            parts.append(f"model={model_ms:.0f}ms")
+
+        if self.t_first_transcript > 0 and self.t_first_audio > 0:
+            gap = (self.t_first_audio - self.t_first_transcript) * 1000
+            parts.append(f"txt→aud={gap:.0f}ms")
+
+        if self.t_first_play_sent > 0 and self.t_first_audio > 0:
+            pipe = (self.t_first_play_sent - self.t_first_audio) * 1000
+            parts.append(f"pipe={pipe:.0f}ms")
+
+        if self.t_first_play_sent > 0 and self.t_turn_start > 0:
+            e2e = (self.t_first_play_sent - self.t_turn_start) * 1000
+            parts.append(f"e2e={e2e:.0f}ms")
+
+        parts.append(f"chunks={self.audio_chunks_received}")
+
+        if self.play_pipeline_samples_ms:
+            avg = statistics.mean(self.play_pipeline_samples_ms)
+            p95 = sorted(self.play_pipeline_samples_ms)[
+                int(len(self.play_pipeline_samples_ms) * 0.95)
+            ] if len(self.play_pipeline_samples_ms) >= 2 else avg
+            parts.append(f"play_avg={avg:.1f}ms p95={p95:.1f}ms")
+
+        for tc in self.tool_calls:
+            name = tc.get("name", "?")
+            exec_ms = tc.get("exec_ms", 0)
+            rt_ms = tc.get("round_trip_ms", 0)
+            parts.append(f"tool({name})={exec_ms:.0f}ms rt={rt_ms:.0f}ms")
+
+        dur = 0.0
+        if self.t_turn_end > 0 and self.t_turn_start > 0:
+            dur = (self.t_turn_end - self.t_turn_start)
+        parts.append(f"dur={dur:.2f}s")
+
+        return " | ".join(parts)
+
+
+@dataclass
+class CallLatencyTracker:
+    """Aggregates TurnMetrics across an entire call."""
+    call_id: str = ""
+    call_start: float = field(default_factory=time.monotonic)
+    turns: List[TurnMetrics] = field(default_factory=list)
+
+    # Send-path metrics
+    send_conversion_samples_us: List[float] = field(default_factory=list)
+    send_queue_wait_samples_us: List[float] = field(default_factory=list)
+
+    # Consumer-side timestamps (set from consumers.py)
+    ws_receive_to_send_audio_samples_us: List[float] = field(
+        default_factory=list
+    )
+
+    # Interruption latencies
+    interruption_latencies_ms: List[float] = field(default_factory=list)
+
+    # Queue depth snapshots
+    in_q_depth_samples: List[int] = field(default_factory=list)
+    out_q_depth_samples: List[int] = field(default_factory=list)
+
+    def new_turn(self, turn_number: int) -> TurnMetrics:
+        tm = TurnMetrics(turn_number=turn_number, t_turn_start=time.monotonic())
+        self.turns.append(tm)
+        return tm
+
+    def current_turn(self) -> Optional[TurnMetrics]:
+        return self.turns[-1] if self.turns else None
+
+    def record_send_conversion(self, duration_us: float) -> None:
+        self.send_conversion_samples_us.append(duration_us)
+
+    def record_send_queue_wait(self, duration_us: float) -> None:
+        self.send_queue_wait_samples_us.append(duration_us)
+
+    def record_interruption(self, latency_ms: float) -> None:
+        self.interruption_latencies_ms.append(latency_ms)
+
+    def record_queue_depths(self, in_q: int, out_q: int) -> None:
+        self.in_q_depth_samples.append(in_q)
+        self.out_q_depth_samples.append(out_q)
+
+    def summary(self) -> str:
+        """Generate a comprehensive end-of-call metrics report."""
+        lines = []
+        call_dur = time.monotonic() - self.call_start
+        lines.append(f"{'='*70}")
+        lines.append(f"  LATENCY METRICS — {self.call_id} ({call_dur:.1f}s)")
+        lines.append(f"{'='*70}")
+
+        # ── per-turn breakdown ────────────────────────────────────────
+        lines.append("")
+        lines.append("  PER-TURN BREAKDOWN:")
+        model_times = []
+        e2e_times = []
+        pipe_times = []
+        for tm in self.turns:
+            lines.append(f"    {tm.summary()}")
+            if tm.t_first_audio > 0 and tm.t_turn_start > 0:
+                model_times.append(
+                    (tm.t_first_audio - tm.t_turn_start) * 1000
+                )
+            if tm.t_first_play_sent > 0 and tm.t_turn_start > 0:
+                e2e_times.append(
+                    (tm.t_first_play_sent - tm.t_turn_start) * 1000
+                )
+            pipe_times.extend(tm.play_pipeline_samples_ms)
+
+        # ── aggregate stats ───────────────────────────────────────────
+        lines.append("")
+        lines.append("  AGGREGATE STATS:")
+
+        if model_times:
+            lines.append(
+                f"    Model response (1st audio):  "
+                f"avg={statistics.mean(model_times):.0f}ms  "
+                f"min={min(model_times):.0f}ms  "
+                f"max={max(model_times):.0f}ms  "
+                f"p50={_percentile(model_times, 50):.0f}ms  "
+                f"p95={_percentile(model_times, 95):.0f}ms"
+            )
+        if e2e_times:
+            lines.append(
+                f"    E2E (turn start→telephony):  "
+                f"avg={statistics.mean(e2e_times):.0f}ms  "
+                f"min={min(e2e_times):.0f}ms  "
+                f"max={max(e2e_times):.0f}ms  "
+                f"p50={_percentile(e2e_times, 50):.0f}ms  "
+                f"p95={_percentile(e2e_times, 95):.0f}ms"
+            )
+        if pipe_times:
+            lines.append(
+                f"    Play pipeline (mix+enc+send): "
+                f"avg={statistics.mean(pipe_times):.1f}ms  "
+                f"p50={_percentile(pipe_times, 50):.1f}ms  "
+                f"p95={_percentile(pipe_times, 95):.1f}ms  "
+                f"max={max(pipe_times):.1f}ms"
+            )
+
+        # ── send-path stats ───────────────────────────────────────────
+        if self.send_conversion_samples_us:
+            avg_us = statistics.mean(self.send_conversion_samples_us)
+            p95_us = _percentile(self.send_conversion_samples_us, 95)
+            lines.append(
+                f"    Send audio conversion:       "
+                f"avg={avg_us:.0f}μs  "
+                f"p95={p95_us:.0f}μs  "
+                f"n={len(self.send_conversion_samples_us)}"
+            )
+        if self.send_queue_wait_samples_us:
+            avg_us = statistics.mean(self.send_queue_wait_samples_us)
+            p95_us = _percentile(self.send_queue_wait_samples_us, 95)
+            lines.append(
+                f"    Send queue→Gemini:           "
+                f"avg={avg_us:.0f}μs  "
+                f"p95={p95_us:.0f}μs"
+            )
+
+        # ── consumer-side stats ───────────────────────────────────────
+        if self.ws_receive_to_send_audio_samples_us:
+            avg_us = statistics.mean(
+                self.ws_receive_to_send_audio_samples_us
+            )
+            p95_us = _percentile(
+                self.ws_receive_to_send_audio_samples_us, 95
+            )
+            lines.append(
+                f"    WS receive→send_audio:       "
+                f"avg={avg_us:.0f}μs  "
+                f"p95={p95_us:.0f}μs"
+            )
+
+        # ── interruptions ─────────────────────────────────────────────
+        if self.interruption_latencies_ms:
+            lines.append(
+                f"    Interruptions:               "
+                f"count={len(self.interruption_latencies_ms)}  "
+                f"avg={statistics.mean(self.interruption_latencies_ms):.0f}ms  "
+                f"max={max(self.interruption_latencies_ms):.0f}ms"
+            )
+
+        # ── queue depth stats ─────────────────────────────────────────
+        if self.in_q_depth_samples:
+            lines.append(
+                f"    Input queue depth:           "
+                f"avg={statistics.mean(self.in_q_depth_samples):.1f}  "
+                f"max={max(self.in_q_depth_samples)}"
+            )
+        if self.out_q_depth_samples:
+            lines.append(
+                f"    Output queue depth:          "
+                f"avg={statistics.mean(self.out_q_depth_samples):.1f}  "
+                f"max={max(self.out_q_depth_samples)}"
+            )
+
+        # ── tool call stats ───────────────────────────────────────────
+        all_tool_calls = []
+        for tm in self.turns:
+            all_tool_calls.extend(tm.tool_calls)
+        if all_tool_calls:
+            exec_times = [tc["exec_ms"] for tc in all_tool_calls]
+            rt_times = [tc["round_trip_ms"] for tc in all_tool_calls
+                        if tc.get("round_trip_ms", 0) > 0]
+            lines.append(
+                f"    Tool exec:                   "
+                f"count={len(all_tool_calls)}  "
+                f"avg={statistics.mean(exec_times):.0f}ms  "
+                f"max={max(exec_times):.0f}ms"
+            )
+            if rt_times:
+                lines.append(
+                    f"    Tool round-trip (→1st audio): "
+                    f"avg={statistics.mean(rt_times):.0f}ms  "
+                    f"max={max(rt_times):.0f}ms"
+                )
+
+        lines.append(f"{'='*70}")
+        return "\n".join(lines)
+
+
+def _percentile(data: List[float], pct: int) -> float:
+    """Simple percentile (nearest-rank method)."""
+    if not data:
+        return 0.0
+    s = sorted(data)
+    idx = max(0, min(int(len(s) * pct / 100), len(s) - 1))
+    return s[idx]
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -403,6 +706,12 @@ class GeminiVoiceProvider(VoiceProvider):
         # timestamp of last voice chunk played — ambient loop uses this
         self._last_voice_play_ts: float = 0.0
 
+        # ── latency metrics tracker ──────────────────────────────────
+        self._metrics = CallLatencyTracker(call_id=call_id or "")
+        self._current_turn_metrics: Optional[TurnMetrics] = None
+        # Tracks the most recent tool call timestamp for round-trip
+        self._pending_tool_t: float = 0.0
+
         # audioop.ratecv filter state — maintains continuity between
         # audio chunks to eliminate inter-chunk clicks/pops.
         self._upsample_state = None     # 8 kHz → 16 kHz  (send path)
@@ -452,6 +761,16 @@ class GeminiVoiceProvider(VoiceProvider):
             CallLogger.log_event(self.call_id, "Disconnected from Gemini")
             analytics.end_call(self.call_id)
             self._record_final_usage()
+
+        # ── Print comprehensive metrics report ──────────────────────
+        metrics_report = self._metrics.summary()
+        print(f"\n{metrics_report}")
+        # Also write to call log file
+        if self.call_id:
+            CallLogger.log_event(
+                self.call_id, "Latency Metrics", metrics_report
+            )
+
         print(
             f"[GEMINI] Disconnected "
             f"(sent={self._chunks_sent} recv={self._chunks_recv})"
@@ -483,9 +802,12 @@ class GeminiVoiceProvider(VoiceProvider):
         if not self._running or not self._session:
             return
         try:
+            t0 = time.monotonic()
             pcm, self._upsample_state = g711_ulaw_to_pcm16k(
                 payload, self._upsample_state
             )
+            conv_us = (time.monotonic() - t0) * 1_000_000
+            self._metrics.record_send_conversion(conv_us)
 
             # ── diagnostic: audio level monitoring ─────────────────
             # Log on first chunk and every 250 chunks (~5 seconds)
@@ -594,8 +916,22 @@ class GeminiVoiceProvider(VoiceProvider):
         )
 
         # --- session config --------------------------------------------------
+        # Context window compression:
+        #   Audio tokens accumulate fast (~25 tokens/sec of audio).
+        #   Without compression, native-audio models degrade from 1.3s
+        #   to 15s+ per turn.  TTS models (2.0-flash-live) are much more
+        #   resilient but still benefit from bounded context.
+        #
+        #   trigger_tokens=15000 / target_tokens=8000:
+        #     Balanced — keeps enough context for coherent conversation
+        #     while preventing unbounded growth.
+        #
+        # media_resolution=LOW:
+        #   Reduces audio token count.  For 8kHz telephony, full
+        #   resolution is wasted — the source is already low-fidelity.
         config = types.LiveConnectConfig(
             response_modalities=["AUDIO"],
+            media_resolution="MEDIA_RESOLUTION_LOW",
             speech_config=types.SpeechConfig(
                 voice_config=types.VoiceConfig(
                     prebuilt_voice_config=types.PrebuiltVoiceConfig(
@@ -608,8 +944,8 @@ class GeminiVoiceProvider(VoiceProvider):
                 role="user",
             ),
             context_window_compression=types.ContextWindowCompressionConfig(
-                trigger_tokens=25600,
-                sliding_window=types.SlidingWindow(target_tokens=12800),
+                trigger_tokens=15000,
+                sliding_window=types.SlidingWindow(target_tokens=8000),
             ),
             # Disable thinking — adds seconds of latency
             thinking_config=types.ThinkingConfig(thinking_budget=0),
@@ -622,10 +958,13 @@ class GeminiVoiceProvider(VoiceProvider):
 
         n_tools = len(tools[0].function_declarations)
         snd = "ON" if self._soundscape else "OFF"
+        prompt_tokens = len(self.system_prompt) // 4  # rough estimate
         print(
             f"[GEMINI] Connecting to {self.model} "
-            f"(tools={n_tools}, VAD=HIGH/LOW/200/500, "
-            f"gain={TELEPHONY_GAIN}x, think=OFF, soundscape={snd})…"
+            f"(tools={n_tools}, VAD=HIGH/LOW/150/300, "
+            f"gain={TELEPHONY_GAIN}x, think=OFF, soundscape={snd}, "
+            f"media=LOW, compress=15K→8K, "
+            f"prompt≈{prompt_tokens} tokens)…"
         )
 
         # --- session ---------------------------------------------------------
@@ -783,11 +1122,22 @@ class GeminiVoiceProvider(VoiceProvider):
             while self._running:
                 try:
                     msg = await self._audio_in_q.get()
+
+                    t_before_send = time.monotonic()
                     await session.send_realtime_input(audio=msg)
+                    send_us = (time.monotonic() - t_before_send) * 1_000_000
+                    self._metrics.record_send_queue_wait(send_us)
 
                     now = time.monotonic()
                     self._last_audio_sent_time = now
                     self._chunks_sent += 1
+
+                    # Periodic queue depth recording
+                    if self._chunks_sent % 50 == 0:
+                        self._metrics.record_queue_depths(
+                            self._audio_in_q.qsize(),
+                            self._audio_out_q.qsize(),
+                        )
 
                     if self._chunks_sent == 1:
                         print("[GEMINI] ▶ First audio chunk sent")
@@ -851,8 +1201,13 @@ class GeminiVoiceProvider(VoiceProvider):
                     turn_count += 1
                     turn_audio_chunks = 0
                     turn_start_time = time.monotonic()
-                    first_transcript_time = 0.0  # for latency measurement
+                    first_transcript_time = 0.0
                     first_audio_time = 0.0
+
+                    # ── metrics: new turn ──────────────────────────────
+                    tm = self._metrics.new_turn(turn_count)
+                    self._current_turn_metrics = tm
+
                     print(
                         f"[GEMINI] [recv] Turn {turn_count} — "
                         f"waiting for responses…"
@@ -870,12 +1225,8 @@ class GeminiVoiceProvider(VoiceProvider):
                         if sc is not None:
 
                             # ── transcriptions (user & assistant) ──────
-                            # Gemini streams transcriptions word-by-word.
-                            # We accumulate fragments and flush complete
-                            # utterances on speaker change / turn end.
                             it = sc.input_transcription
                             if it and it.text:
-                                # Speaker changed to user → flush assistant
                                 if self._assistant_transcript_buf:
                                     self._flush_assistant_transcript()
                                 self._user_transcript_buf += it.text
@@ -886,21 +1237,30 @@ class GeminiVoiceProvider(VoiceProvider):
                                     first_transcript_time = (
                                         time.monotonic()
                                     )
-                                # Speaker changed to assistant → flush user
+                                    tm.t_first_transcript = (
+                                        first_transcript_time
+                                    )
                                 if self._user_transcript_buf:
                                     self._flush_user_transcript()
                                 self._assistant_transcript_buf += ot.text
 
                             # INTERRUPTION
                             if sc.interrupted:
-                                # Flush partial transcripts before clearing
                                 self._flush_all_transcripts()
+                                t_interrupt = time.monotonic()
+                                int_latency_ms = (
+                                    t_interrupt - turn_start_time
+                                ) * 1000
+                                self._metrics.record_interruption(
+                                    int_latency_ms
+                                )
                                 print(
                                     f"[GEMINI] [recv] Turn {turn_count}: "
-                                    f"INTERRUPTED (audio in out_q="
+                                    f"INTERRUPTED after "
+                                    f"{int_latency_ms:.0f}ms "
+                                    f"(out_q="
                                     f"{self._audio_out_q.qsize()})"
                                 )
-                                # Stop keyboard if active
                                 if (self._soundscape
                                         and self._soundscape
                                         .keyboard_active):
@@ -923,15 +1283,22 @@ class GeminiVoiceProvider(VoiceProvider):
                                             isinstance(idata.data, bytes)):
                                         self._chunks_recv += 1
                                         turn_audio_chunks += 1
+                                        tm.audio_chunks_received += 1
+
                                         if turn_audio_chunks == 1:
                                             first_audio_time = (
                                                 time.monotonic()
+                                            )
+                                            tm.t_first_audio = (
+                                                first_audio_time
+                                            )
+                                            tm.out_q_at_first_audio = (
+                                                self._audio_out_q.qsize()
                                             )
                                             elapsed = (
                                                 first_audio_time
                                                 - turn_start_time
                                             )
-                                            # Measure text→audio gap
                                             txt_gap = ""
                                             if first_transcript_time > 0:
                                                 gap = (
@@ -939,8 +1306,8 @@ class GeminiVoiceProvider(VoiceProvider):
                                                     - first_transcript_time
                                                 ) * 1000
                                                 txt_gap = (
-                                                    f" (transcript→audio "
-                                                    f"gap: {gap:.0f}ms)"
+                                                    f" (txt→aud="
+                                                    f"{gap:.0f}ms)"
                                                 )
                                             print(
                                                 f"[GEMINI] ◀ First audio "
@@ -949,8 +1316,20 @@ class GeminiVoiceProvider(VoiceProvider):
                                                 f"{txt_gap}"
                                             )
 
-                                        # Stop keyboard clicks as soon
-                                        # as Gemini starts speaking
+                                            # If this audio follows a tool
+                                            # call, record round-trip
+                                            if self._pending_tool_t > 0:
+                                                tool_rt = (
+                                                    first_audio_time
+                                                    - self._pending_tool_t
+                                                ) * 1000
+                                                if tm.tool_calls:
+                                                    tm.tool_calls[-1][
+                                                        "round_trip_ms"
+                                                    ] = tool_rt
+                                                self._pending_tool_t = 0.0
+
+                                        # Stop keyboard
                                         if (self._soundscape
                                                 and self._soundscape
                                                 .keyboard_active):
@@ -961,8 +1340,7 @@ class GeminiVoiceProvider(VoiceProvider):
                                             )
 
                                         # Downsample to 8kHz PCM (raw)
-                                        # Mixing + μ-law encoding happens
-                                        # in _play_audio_loop
+                                        t_ds = time.monotonic()
                                         pcm8k, self._downsample_state = (
                                             pcm24k_to_pcm8k(
                                                 idata.data,
@@ -973,13 +1351,16 @@ class GeminiVoiceProvider(VoiceProvider):
                                             self._audio_out_q.put_nowait(
                                                 pcm8k
                                             )
+                                            if turn_audio_chunks == 1:
+                                                tm.t_first_audio_queued = (
+                                                    time.monotonic()
+                                                )
 
                                     if part.text:
                                         print(
                                             f"[GEMINI] [recv] Text: "
                                             f"{part.text[:80]!r}"
                                         )
-                                        # Buffer text (same as output_transcription)
                                         if self._user_transcript_buf:
                                             self._flush_user_transcript()
                                         self._assistant_transcript_buf += (
@@ -987,13 +1368,11 @@ class GeminiVoiceProvider(VoiceProvider):
                                         )
                             else:
                                 # server_content with no model_turn
-                                # and not interrupted — inspect fields
                                 if not sc.interrupted:
                                     tc_flag = getattr(
                                         sc, "turn_complete", False
                                     )
                                     if not tc_flag:
-                                        # Log all non-None fields
                                         fields = {}
                                         for attr in (
                                             "model_turn",
@@ -1008,17 +1387,21 @@ class GeminiVoiceProvider(VoiceProvider):
                                                 fields[attr] = (
                                                     str(v)[:100]
                                                 )
-                                        print(
-                                            f"[GEMINI] [recv] "
-                                            f"server_content (no "
-                                            f"model_turn) turn "
-                                            f"{turn_count}: {fields}"
-                                        )
+                                        # Only log if there's something
+                                        # interesting (skip empty dicts)
+                                        if fields:
+                                            print(
+                                                f"[GEMINI] [recv] "
+                                                f"server_content (no "
+                                                f"model_turn) turn "
+                                                f"{turn_count}: {fields}"
+                                            )
                             continue
 
                         # ── tool call ──────────────────────────────────
                         tc = response.tool_call
                         if tc is not None:
+                            self._pending_tool_t = time.monotonic()
                             n_funcs = len(tc.function_calls or [])
                             print(
                                 f"[GEMINI] [recv] Turn {turn_count}: "
@@ -1031,7 +1414,6 @@ class GeminiVoiceProvider(VoiceProvider):
                             continue
 
                         # ── unknown response type ──────────────────────
-                        # Log anything we don't recognize
                         resp_attrs = []
                         for attr in (
                             "server_content", "tool_call",
@@ -1047,10 +1429,10 @@ class GeminiVoiceProvider(VoiceProvider):
                             )
 
                     # ── turn complete ───────────────────────────────────
-                    # Flush any remaining transcript fragments
                     self._flush_all_transcripts()
+                    tm.t_turn_end = time.monotonic()
 
-                    elapsed = time.monotonic() - turn_start_time
+                    elapsed = tm.t_turn_end - turn_start_time
                     print(
                         f"[GEMINI] Turn {turn_count} complete — "
                         f"{turn_audio_chunks} audio chunks in "
@@ -1059,14 +1441,14 @@ class GeminiVoiceProvider(VoiceProvider):
                         f"recv={self._chunks_recv}, "
                         f"out_q={self._audio_out_q.qsize()})"
                     )
+                    # Print per-turn metrics summary
+                    print(f"[GEMINI] [metrics] {tm.summary()}")
 
                     if self.on_response_done:
                         await self.on_response_done()
 
-                    # Loop back to session.receive() for next turn
-
                 except asyncio.CancelledError:
-                    raise  # let outer handler catch
+                    raise
                 except Exception as e:
                     err_str = str(e).lower()
                     if "closed" in err_str or "cancelled" in err_str:
@@ -1075,7 +1457,6 @@ class GeminiVoiceProvider(VoiceProvider):
                             f"(turn {turn_count}): {e}"
                         )
                         break
-                    # Non-fatal — log full traceback and try to recover
                     print(
                         f"[GEMINI] [recv] ERROR in turn {turn_count}: "
                         f"{type(e).__name__}: {e}"
@@ -1084,8 +1465,6 @@ class GeminiVoiceProvider(VoiceProvider):
                         f"[GEMINI] Receive error (turn {turn_count})",
                         exc_info=True,
                     )
-                    # Try next turn — if connection is dead,
-                    # session.receive() will fail immediately
                     continue
         except asyncio.CancelledError:
             pass
@@ -1117,9 +1496,9 @@ class GeminiVoiceProvider(VoiceProvider):
                 try:
                     pcm8k = await self._audio_out_q.get()
 
-                    now = time.monotonic()
+                    t_dequeued = time.monotonic()
                     # Timestamp for ambient grace period
-                    self._last_voice_play_ts = now
+                    self._last_voice_play_ts = t_dequeued
 
                     # Mix soundscape in LINEAR PCM space
                     if self._soundscape:
@@ -1129,13 +1508,25 @@ class GeminiVoiceProvider(VoiceProvider):
                     ulaw = pcm8k_to_g711_ulaw(pcm8k)
                     if ulaw and self.on_audio:
                         await self.on_audio(ulaw)
+
+                    t_sent = time.monotonic()
+                    pipe_ms = (t_sent - t_dequeued) * 1000
                     played += 1
 
-                    # Log pipeline overhead for first chunk
+                    # ── metrics: record play pipeline ─────────────────
+                    tm = self._current_turn_metrics
+                    if tm is not None:
+                        tm.audio_chunks_played += 1
+                        # Sample every 10th chunk to reduce overhead
+                        if tm.audio_chunks_played % 10 == 1:
+                            tm.play_pipeline_samples_ms.append(pipe_ms)
+                        # Capture first chunk timestamps
+                        if tm.audio_chunks_played == 1:
+                            tm.t_first_play_dequeued = t_dequeued
+                            tm.t_first_play_sent = t_sent
+
+                    # Log first chunk pipeline
                     if played == 1:
-                        pipe_ms = (
-                            time.monotonic() - now
-                        ) * 1000
                         print(
                             f"[GEMINI] [play] First chunk "
                             f"pipeline: {pipe_ms:.1f}ms "
@@ -1230,6 +1621,7 @@ class GeminiVoiceProvider(VoiceProvider):
         """Execute a function call and send the result back via
         send_tool_response."""
         name = "<unknown>"
+        t_tool_start = time.monotonic()
         try:
             name = fc.name
             args = dict(fc.args) if fc.args else {}
@@ -1242,16 +1634,15 @@ class GeminiVoiceProvider(VoiceProvider):
                 )
 
             # Start keyboard clicks for audible "typing" feedback.
-            # The _ambient_fill_loop generates idle frames continuously;
-            # when keyboard is active, those frames include click sounds.
             if self._soundscape:
                 self._soundscape.start_keyboard()
                 print("[GEMINI] ⌨ Keyboard started (tool executing)")
 
             # execute
-            t0 = time.monotonic()
+            t_exec_start = time.monotonic()
             result = _execute_tool(name, args)
-            exec_ms = (time.monotonic() - t0) * 1000
+            t_exec_end = time.monotonic()
+            exec_ms = (t_exec_end - t_exec_start) * 1000
             print(
                 f"[GEMINI] Tool '{name}' executed in {exec_ms:.0f}ms, "
                 f"result type={type(result).__name__}"
@@ -1275,6 +1666,7 @@ class GeminiVoiceProvider(VoiceProvider):
                     print(f"[GEMINI] Display → {result['url']}")
 
             # send result back to Gemini
+            t_response_sent = 0.0
             if result is not None:
                 result_str = (
                     json.dumps(result, ensure_ascii=False)
@@ -1295,8 +1687,11 @@ class GeminiVoiceProvider(VoiceProvider):
                     await session.send_tool_response(
                         function_responses=func_response
                     )
+                    t_response_sent = time.monotonic()
+                    send_ms = (t_response_sent - t_exec_end) * 1000
                     print(
-                        f"[GEMINI] ✓ Tool response sent for '{name}'"
+                        f"[GEMINI] ✓ Tool response sent for '{name}' "
+                        f"(send={send_ms:.0f}ms)"
                     )
                 except Exception as send_err:
                     print(
@@ -1307,7 +1702,7 @@ class GeminiVoiceProvider(VoiceProvider):
                         f"[GEMINI] send_tool_response failed",
                         exc_info=True,
                     )
-                    raise  # re-raise so receive_loop sees it
+                    raise
 
                 if self.call_id:
                     count = len(result) if isinstance(result, list) else 1
@@ -1319,6 +1714,28 @@ class GeminiVoiceProvider(VoiceProvider):
                     f"[GEMINI] ⚠ Tool '{name}' returned None — "
                     f"no response sent to Gemini"
                 )
+
+            # ── metrics: record tool call ─────────────────────────────
+            total_ms = (time.monotonic() - t_tool_start) * 1000
+            tool_metrics = {
+                "name": name,
+                "exec_ms": exec_ms,
+                "send_ms": (
+                    (t_response_sent - t_exec_end) * 1000
+                    if t_response_sent > 0 else 0
+                ),
+                "total_ms": total_ms,
+                "round_trip_ms": 0.0,  # filled when first audio arrives
+            }
+            tm = self._current_turn_metrics
+            if tm is not None:
+                tm.tool_calls.append(tool_metrics)
+            print(
+                f"[GEMINI] [metrics] Tool '{name}': "
+                f"exec={exec_ms:.0f}ms "
+                f"send={tool_metrics['send_ms']:.0f}ms "
+                f"total={total_ms:.0f}ms"
+            )
 
         except Exception as e:
             print(

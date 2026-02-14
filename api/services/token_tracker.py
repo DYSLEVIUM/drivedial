@@ -209,7 +209,7 @@ class TokenTracker:
         # ---------------------------------------------------------
 
         # 5. Gemini 2.0 Flash Live (Multimodal Live API)
-        "gemini-2.5-flash-native-audio-preview-09-2025": {
+        "gemini-2.5-flash-native-audio-preview-12-2025": {
             "text_input": Decimal("0.50") / Decimal("1000000"),
             "text_input_cached": Decimal("0.50") / Decimal("1000000"),
             "text_output": Decimal("2.00") / Decimal("1000000"),

@@ -21,6 +21,7 @@ Race-condition guard:
 import asyncio
 import json
 import logging
+import time
 import uuid
 from typing import Optional
 
@@ -221,6 +222,8 @@ class BaseMediaStreamConsumer(AsyncWebsocketConsumer):
 
     async def _on_media(self, data: dict) -> None:
         """Handle incoming audio from telephony provider."""
+        t_ws_recv = time.monotonic()
+
         # Late-start initialisation (providers that don't send 'start')
         if not self._first_media_received:
             self._first_media_received = True
@@ -240,6 +243,14 @@ class BaseMediaStreamConsumer(AsyncWebsocketConsumer):
             audio_msg = self.telephony_provider.parse_audio_message(data)
             if audio_msg and audio_msg.payload:
                 await self.voice_provider.send_audio(audio_msg.payload)
+
+                # ── metrics: WS receive → send_audio latency ────────
+                elapsed_us = (time.monotonic() - t_ws_recv) * 1_000_000
+                metrics = getattr(self.voice_provider, "_metrics", None)
+                if metrics is not None:
+                    metrics.ws_receive_to_send_audio_samples_us.append(
+                        elapsed_us
+                    )
 
     async def _connect_voice_provider(self) -> None:
         """
@@ -286,7 +297,15 @@ class BaseMediaStreamConsumer(AsyncWebsocketConsumer):
             message = self.telephony_provider.format_audio_message(
                 self.stream_id, audio_payload
             )
+            t0 = time.monotonic()
             await self.send(json.dumps(message))
+            ws_send_us = (time.monotonic() - t0) * 1_000_000
+            # Log slow WS sends (> 5ms) — indicates back-pressure
+            if ws_send_us > 5000:
+                print(
+                    f"[WS-DIAG] Slow WS send: {ws_send_us/1000:.1f}ms "
+                    f"(out #{self._media_out_count})"
+                )
 
     async def _clear_buffer(self) -> None:
         """Clear audio buffer (for handling interruptions)."""
